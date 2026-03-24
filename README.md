@@ -62,18 +62,11 @@ pip install -e .
 
 This step is required before both training and inference.
 
-Step 1: set the Wan model directory first (recommended):
+Step 1: set the Wan model directory first (opional, default `./checkpoints`):
 
 ```bash
 mkdir -p checkpoints
 export DIFFSYNTH_MODEL_BASE_PATH="$(pwd)/checkpoints"
-```
-
-To make it persistent (optional):
-
-```bash
-echo 'export DIFFSYNTH_MODEL_BASE_PATH=/path/to/FastWAM/checkpoints' >> ~/.bashrc
-source ~/.bashrc
 ```
 
 Step 2: pre-generate the ActionDiT backbone (interpolated from Wan22 DiT):

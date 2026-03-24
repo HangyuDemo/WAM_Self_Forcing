@@ -62,18 +62,11 @@ pip install -e .
 
 这一步同时是训练和推理的前置项。
 
-第一步，先设置 Wan 模型目录（建议）：
+第一步，先设置 Wan 模型目录（可选，默认 `./checkpoints`）：
 
 ```bash
 mkdir -p checkpoints
 export DIFFSYNTH_MODEL_BASE_PATH="$(pwd)/checkpoints"
-```
-
-如需长期生效（可选）：
-
-```bash
-echo 'export DIFFSYNTH_MODEL_BASE_PATH=/path/to/FastWAM/checkpoints' >> ~/.bashrc
-source ~/.bashrc
 ```
 
 第二步，预生成 ActionDiT backbone（从Wan22 DiT插值）：
