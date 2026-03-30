@@ -256,6 +256,8 @@ bash scripts/train_zero1.sh 8 task=libero_uncond_2cam224_1e-4
 bash scripts/train_zero1.sh 8 task=robotwin_uncond_3cam_384_1e-4
 ```
 
+For LIBERO, we train on a single node with 8 GPUs. For RoboTwin, we use 64 GPUs to accelerate training. You can try reducing the GPU count or training epochs.
+
 ## Inference with Your Trained Checkpoints
 
 The `mujoco` environment should ideally stay consistent with the LIBERO data version. Then run LIBERO evaluation:

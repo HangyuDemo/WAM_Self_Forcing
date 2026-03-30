@@ -257,6 +257,8 @@ bash scripts/train_zero1.sh 8 task=libero_uncond_2cam224_1e-4
 bash scripts/train_zero1.sh 8 task=robotwin_uncond_3cam_384_1e-4
 ```
 
+对于LIBERO，我们使用单机8卡训练。对于RoboTwin，我们使用了64卡来加速训练，你可以尝试调小卡数和训练总epoch数。
+
 ## 使用自己训练的权重推理
 
 `mujoco` 环境和 LIBERO 数据版本相关，最好保持一致。之后再运行 LIBERO 评测：
