@@ -113,7 +113,7 @@ def _load_registered_model(
     state_dict_converter = matched_config.get("state_dict_converter")
 
     model = model_class(**model_kwargs)
-    state_dict = load_state_dict(path, torch_dtype=torch_dtype, device=device)
+    state_dict = load_state_dict(path, torch_dtype=torch_dtype, device="cpu")
     if state_dict_converter is not None:
         state_dict = state_dict_converter(state_dict)
 

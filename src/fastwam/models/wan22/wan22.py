@@ -395,7 +395,7 @@ class Wan22Core(torch.nn.Module):
         torch.save(payload, path)
 
     def load_checkpoint(self, path, optimizer=None):
-        payload = torch.load(path, map_location=self.device)
+        payload = torch.load(path, map_location="cpu")
         self.dit.load_state_dict(payload["dit"], strict=False)
         if optimizer is not None and "optimizer" in payload:
             optimizer.load_state_dict(payload["optimizer"])
