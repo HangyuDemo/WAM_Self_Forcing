@@ -9,6 +9,12 @@ runs
 runs/
 evaluate_results/
 .deepspeed*
+slurm_logs/
+*.out
+*.err
+train.log
+train_idm_self_forcing.log
+precompute_text_embeds.log
 
 
 # ai coding
