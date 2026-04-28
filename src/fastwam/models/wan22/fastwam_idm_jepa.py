@@ -179,11 +179,16 @@ class FastWAMIDMJEPA(FastWAMIDM):
             features = self.jepa_encoder.get_vision_features(pixel_values_b)
 
         features = self._pool_jepa_features(features, num_input_frames=int(pixel_values_b.shape[1]))
-        if features.shape[0] % num_views != 0:
+        if features.shape[0] != bsz * num_views:
             raise ValueError(
-                f"Unexpected JEPA feature batch shape {tuple(features.shape)} for num_views={num_views}"
+                "Unexpected JEPA feature batch shape for multiview encoding: "
+                f"got {tuple(features.shape)}, expected batch={bsz * num_views}"
             )
-        features = torch.cat(torch.chunk(features, chunks=num_views, dim=0), dim=2)
+        # Flatten order is [b0v0, b0v1, b1v0, b1v1, ...], so chunk(dim=0) would
+        # mix different samples incorrectly. Reshape back to [B, V, T, D] first,
+        # then fuse views on the feature dimension.
+        features = features.view(bsz, num_views, features.shape[1], features.shape[2])
+        features = features.permute(0, 2, 1, 3).reshape(bsz, features.shape[2], num_views * features.shape[3])
         return features.to(device=self.device, dtype=self.torch_dtype)
 
     def _predict_jepa_trajectory(
@@ -241,17 +246,6 @@ class FastWAMIDMJEPA(FastWAMIDM):
             )
         target_jepa_obs = target_jepa_full[:, :1]
         target_jepa_future = target_jepa_full[:, 1:]
-
-        # Inject JEPA trajectory into action context.
-        jepa_cond = torch.cat([target_jepa_obs, target_jepa_future], dim=1)
-        jepa_cond_ctx = self.dit.jepa_action_ctx_proj(jepa_cond.to(dtype=context.dtype))
-        jepa_cond_mask = torch.ones(
-            (batch_size, jepa_cond_ctx.shape[1]),
-            dtype=torch.bool,
-            device=context_mask.device,
-        )
-        action_context = torch.cat([context, jepa_cond_ctx], dim=1)
-        action_context_mask = torch.cat([context_mask, jepa_cond_mask], dim=1)
 
         # Branch A: noisy video (used to predict JEPA latent trajectory).
         noise_video = torch.randn_like(input_latents)
@@ -318,11 +312,15 @@ class FastWAMIDMJEPA(FastWAMIDM):
                 "ensure `seperated_timestep=true` and `fuse_vae_embedding_in_latents=true`."
             )
 
-        action_pre = self.action_expert.pre_dit(
+        # Pass 1: run the video path and predict JEPA latent trajectory.
+        # We intentionally keep the first pass action context text-only so that
+        # the JEPA condition in pass 2 is sourced from the model's own predicted
+        # JEPA trajectory rather than the ground-truth future trajectory.
+        action_pre_stage1 = self.action_expert.pre_dit(
             action_tokens=noisy_action,
             timestep=timestep_action,
-            context=action_context,
-            context_mask=action_context_mask,
+            context=context,
+            context_mask=context_mask,
         )
 
         noisy_video_seq_len = int(video_pre_noisy["tokens"].shape[1])
@@ -338,7 +336,7 @@ class FastWAMIDMJEPA(FastWAMIDM):
         attention_mask = self._build_teacher_forcing_attention_mask(
             noisy_video_seq_len=noisy_video_seq_len,
             cond_video_seq_len=cond_video_seq_len,
-            action_seq_len=action_pre["tokens"].shape[1],
+            action_seq_len=action_pre_stage1["tokens"].shape[1],
             noisy_video_tokens_per_frame=noisy_video_tokens_per_frame,
             cond_video_tokens_per_frame=cond_video_tokens_per_frame,
             device=merged_video_tokens.device,
@@ -347,12 +345,12 @@ class FastWAMIDMJEPA(FastWAMIDM):
         tokens_out = self.mot(
             embeds_all={
                 "video": merged_video_tokens,
-                "action": action_pre["tokens"],
+                "action": action_pre_stage1["tokens"],
             },
             attention_mask=attention_mask,
             freqs_all={
                 "video": merged_video_freqs,
-                "action": action_pre["freqs"],
+                "action": action_pre_stage1["freqs"],
             },
             context_all={
                 "video": {
@@ -360,13 +358,13 @@ class FastWAMIDMJEPA(FastWAMIDM):
                     "mask": merged_video_context_mask,
                 },
                 "action": {
-                    "context": action_pre["context"],
-                    "mask": action_pre["context_mask"],
+                    "context": action_pre_stage1["context"],
+                    "mask": action_pre_stage1["context_mask"],
                 },
             },
             t_mod_all={
                 "video": merged_video_t_mod,
-                "action": action_pre["t_mod"],
+                "action": action_pre_stage1["t_mod"],
             },
         )
 
@@ -389,7 +387,50 @@ class FastWAMIDMJEPA(FastWAMIDM):
         )
         loss_jepa = (jepa_loss_per_sample * jepa_weight).mean()
 
-        pred_action = self.action_expert.post_dit(tokens_out["action"], action_pre)
+        # Pass 2: feed the *predicted* JEPA trajectory into the action branch.
+        if self.jepa_predict_future_only:
+            pred_jepa_cond = torch.cat([target_jepa_obs, pred_jepa_future], dim=1)
+        else:
+            pred_jepa_cond = pred_jepa_full.clone()
+            pred_jepa_cond[:, :1] = target_jepa_obs
+        jepa_cond_ctx = self.dit.jepa_action_ctx_proj(pred_jepa_cond.to(dtype=context.dtype))
+        jepa_cond_mask = torch.ones(
+            (batch_size, jepa_cond_ctx.shape[1]),
+            dtype=torch.bool,
+            device=context_mask.device,
+        )
+        action_context = torch.cat([context, jepa_cond_ctx], dim=1)
+        action_context_mask = torch.cat([context_mask, jepa_cond_mask], dim=1)
+
+        action_pre = self.action_expert.pre_dit(
+            action_tokens=noisy_action,
+            timestep=timestep_action,
+            context=action_context,
+            context_mask=action_context_mask,
+        )
+        video_kv_cache = self.mot.prefill_video_cache(
+            video_tokens=merged_video_tokens,
+            video_freqs=merged_video_freqs,
+            video_t_mod=merged_video_t_mod,
+            video_context_payload={
+                "context": video_pre_noisy["context"],
+                "mask": merged_video_context_mask,
+            },
+            video_attention_mask=attention_mask[: noisy_video_seq_len + cond_video_seq_len, : noisy_video_seq_len + cond_video_seq_len],
+        )
+        action_tokens = self.mot.forward_action_with_video_cache(
+            action_tokens=action_pre["tokens"],
+            action_freqs=action_pre["freqs"],
+            action_t_mod=action_pre["t_mod"],
+            action_context_payload={
+                "context": action_pre["context"],
+                "mask": action_pre["context_mask"],
+            },
+            video_kv_cache=video_kv_cache,
+            attention_mask=attention_mask,
+            video_seq_len=noisy_video_seq_len + cond_video_seq_len,
+        )
+        pred_action = self.action_expert.post_dit(action_tokens, action_pre)
         action_loss_token = F.mse_loss(pred_action.float(), target_action.float(), reduction="none").mean(dim=2)
         if action_is_pad is not None:
             valid = (~action_is_pad).to(device=action_loss_token.device, dtype=action_loss_token.dtype)
@@ -411,3 +452,18 @@ class FastWAMIDMJEPA(FastWAMIDM):
             "loss_action": self.loss_lambda_action * float(loss_action.detach().item()),
         }
         return loss_total, loss_dict
+
+    @torch.no_grad()
+    def infer_action(self, *args, **kwargs):
+        raise NotImplementedError(
+            "FastWAM JEPA-IDM currently implements the JEPA-conditioned training path only. "
+            "The old IDM inference path was intentionally disabled because it does not consume the "
+            "predicted JEPA trajectory and would silently produce inconsistent behavior."
+        )
+
+    @torch.no_grad()
+    def infer_joint(self, *args, **kwargs):
+        raise NotImplementedError(
+            "FastWAM JEPA-IDM currently implements the JEPA-conditioned training path only. "
+            "A dedicated JEPA-aware inference rollout is still needed."
+        )
