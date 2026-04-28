@@ -82,10 +82,7 @@ class Wan22Trainer:
         # Freeze non-trainable modules before optimizer/deepspeed initialization.
         # This keeps DiT (+ optional proprio encoder) as trainable when ZeRO builds optimizer state.
         self._apply_dit_only_train_mode(self.model)
-        trainable_params = list(self.model.dit.parameters())
-        proprio_encoder = getattr(self.model, "proprio_encoder", None)
-        if proprio_encoder is not None:
-            trainable_params.extend(list(proprio_encoder.parameters()))
+        trainable_params = self._collect_trainable_parameters(self.model)
         self.optimizer = torch.optim.AdamW(
             trainable_params,
             lr=self.learning_rate,
@@ -285,6 +282,11 @@ class Wan22Trainer:
 
     @staticmethod
     def _apply_dit_only_train_mode(model):
+        custom_configure = getattr(model, "configure_trainable_modules", None)
+        if callable(custom_configure):
+            custom_configure()
+            return
+
         model.eval()
         model.requires_grad_(False)
         model.dit.train()
@@ -293,6 +295,21 @@ class Wan22Trainer:
         if proprio_encoder is not None:
             proprio_encoder.train()
             proprio_encoder.requires_grad_(True)
+
+    @staticmethod
+    def _collect_trainable_parameters(model):
+        custom_params = getattr(model, "trainable_parameters", None)
+        if callable(custom_params):
+            params = list(custom_params())
+        else:
+            params = [p for p in model.dit.parameters() if p.requires_grad]
+            proprio_encoder = getattr(model, "proprio_encoder", None)
+            if proprio_encoder is not None:
+                params.extend([p for p in proprio_encoder.parameters() if p.requires_grad])
+
+        if not params:
+            raise RuntimeError("No trainable parameters found after applying train mode configuration.")
+        return params
 
     @staticmethod
     def _to_batched_eval_sample(sample):
