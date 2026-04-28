@@ -3,7 +3,10 @@
 outputs/
 checkpoints
 checkpoints_idm_sf
-data
+run_libero_goal_video_lora.slurm
+run_libero_idm_jepa.slurm
+run_libero10_only_idm_self_forcing.slurm
+run_libero10_only_idm.slurm
 data/*
 apex/
 assets/
@@ -86,10 +89,8 @@ share/python-wheels/
 .installed.config
 *.egg
 MANIFEST
-run_libero_goal_video_lora.slurm
-run_libero_idm_jepa.slurm
-run_libero10_only_idm_self_forcing.slurm
-run_libero10_only_idm.slurm
+
+
 # PyInstaller
 #  Usually these files are written by a python script from a template
 #  before PyInstaller builds the exe, so as to inject date/other infos into it.
