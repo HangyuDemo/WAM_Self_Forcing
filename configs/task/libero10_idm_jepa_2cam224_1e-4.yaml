@@ -1,0 +1,33 @@
+# @package _global_
+
+defaults:
+  - override /data: libero_2cam
+  - override /model: fastwam_idm_jepa
+  - _self_
+
+batch_size: 8
+num_workers: 8
+
+data:
+  train:
+    dataset_dirs:
+      - ${oc.env:DATASET_ROOT,/home/ha865618/data/LIBERO_Lerobot/libero_10}
+    return_multi_camera_video: true
+
+model:
+  mot_checkpoint_mixed_attn: true
+  loss:
+    lambda_jepa: 1.0
+    lambda_action: 1.0
+
+lr_scheduler_type: "cosine"
+learning_rate: 1e-4
+num_epochs: 10
+max_steps: null
+log_every: 10
+save_every: 2000
+eval_every: 200
+
+gradient_accumulation_steps: 4
+weight_decay: 1e-2
+resume: null

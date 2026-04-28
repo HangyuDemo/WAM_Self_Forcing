@@ -2,12 +2,15 @@
 # Misc
 outputs/
 checkpoints
+checkpoints_idm_sf
+data
 data/*
 apex/
 assets/
 runs
 runs/
 evaluate_results/
+JEPA_checkpoint/
 .deepspeed*
 slurm_logs/
 *.out

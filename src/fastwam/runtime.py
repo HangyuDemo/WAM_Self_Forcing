@@ -330,6 +330,110 @@ def create_fastwam_idm(
     )
 
 
+def create_fastwam_idm_jepa(
+    model_id: str,
+    tokenizer_model_id: str,
+    video_dit_config,
+    tokenizer_max_len: int = 512,
+    load_text_encoder: bool = True,
+    proprio_dim: int | None = None,
+    action_dit_config=None,
+    action_dit_pretrained_path: str | None = None,
+    skip_dit_load_from_pretrain: bool = False,
+    video_scheduler=None,
+    action_scheduler=None,
+    loss=None,
+    jepa=None,
+    mot_checkpoint_mixed_attn: bool = True,
+    redirect_common_files: bool = True,
+    model_dtype: torch.dtype = torch.bfloat16,
+    device: str = "cuda",
+):
+    from .models.wan22.fastwam_idm_jepa import FastWAMIDMJEPA
+
+    if isinstance(video_dit_config, DictConfig):
+        video_dit_config = OmegaConf.to_container(video_dit_config, resolve=True)
+    if not isinstance(video_dit_config, dict):
+        raise ValueError(f"`video_dit_config` must resolve to a dict, got {type(video_dit_config)}")
+
+    if isinstance(action_dit_config, DictConfig):
+        action_dit_config = OmegaConf.to_container(action_dit_config, resolve=True)
+    if action_dit_config is None:
+        action_dit_config = {}
+    if not isinstance(action_dit_config, dict):
+        raise ValueError(f"`action_dit_config` must resolve to a dict, got {type(action_dit_config)}")
+
+    if isinstance(video_scheduler, DictConfig):
+        video_scheduler = OmegaConf.to_container(video_scheduler, resolve=True)
+    if video_scheduler is None:
+        video_scheduler = {}
+    if not isinstance(video_scheduler, dict):
+        raise ValueError(f"`video_scheduler` must be dict-like, got {type(video_scheduler)}")
+
+    if isinstance(action_scheduler, DictConfig):
+        action_scheduler = OmegaConf.to_container(action_scheduler, resolve=True)
+    if action_scheduler is None:
+        raise ValueError("`action_scheduler` is required for FastWAM.")
+    if not isinstance(action_scheduler, dict):
+        raise ValueError(f"`action_scheduler` must be dict-like, got {type(action_scheduler)}")
+    required_action_scheduler_keys = {"train_shift", "infer_shift", "num_train_timesteps"}
+    missing_keys = required_action_scheduler_keys - set(action_scheduler.keys())
+    if missing_keys:
+        raise ValueError(
+            f"`action_scheduler` missing required keys: {sorted(missing_keys)}. "
+            "Expected keys: train_shift, infer_shift, num_train_timesteps."
+        )
+
+    if isinstance(loss, DictConfig):
+        loss = OmegaConf.to_container(loss, resolve=True)
+    if loss is None:
+        loss = {}
+    if not isinstance(loss, dict):
+        raise ValueError(f"`loss` must be dict-like, got {type(loss)}")
+
+    if isinstance(jepa, DictConfig):
+        jepa = OmegaConf.to_container(jepa, resolve=True)
+    if jepa is None:
+        raise ValueError("`jepa` config is required for `create_fastwam_idm_jepa`.")
+    if not isinstance(jepa, dict):
+        raise ValueError(f"`jepa` must be dict-like, got {type(jepa)}")
+    if "model_id" not in jepa:
+        raise ValueError("`jepa.model_id` is required.")
+
+    model = FastWAMIDMJEPA.from_wan22_pretrained(
+        device=device,
+        torch_dtype=model_dtype,
+        model_id=model_id,
+        tokenizer_model_id=tokenizer_model_id,
+        tokenizer_max_len=int(tokenizer_max_len),
+        load_text_encoder=bool(load_text_encoder),
+        proprio_dim=(None if proprio_dim is None else int(proprio_dim)),
+        redirect_common_files=bool(redirect_common_files),
+        video_dit_config=video_dit_config,
+        action_dit_config=action_dit_config,
+        action_dit_pretrained_path=action_dit_pretrained_path,
+        skip_dit_load_from_pretrain=bool(skip_dit_load_from_pretrain),
+        mot_checkpoint_mixed_attn=bool(mot_checkpoint_mixed_attn),
+        video_train_shift=float(video_scheduler.get("train_shift", 5.0)),
+        video_infer_shift=float(video_scheduler.get("infer_shift", 5.0)),
+        video_num_train_timesteps=int(video_scheduler.get("num_train_timesteps", 1000)),
+        action_train_shift=float(action_scheduler["train_shift"]),
+        action_infer_shift=float(action_scheduler["infer_shift"]),
+        action_num_train_timesteps=int(action_scheduler["num_train_timesteps"]),
+        loss_lambda_video=float(loss.get("lambda_video", 1.0)),
+        loss_lambda_action=float(loss.get("lambda_action", 1.0)),
+    )
+    # Keep `lambda_video` as fallback for compatibility with existing task configs.
+    model.loss_lambda_jepa = float(loss.get("lambda_jepa", loss.get("lambda_video", 1.0)))
+    model.setup_jepa_encoder(
+        jepa_model_id=str(jepa["model_id"]),
+        freeze_encoder=bool(jepa.get("freeze_encoder", True)),
+        pool_mode=str(jepa.get("pool_mode", "mean")),
+        predict_future_only=bool(jepa.get("predict_future_only", True)),
+    )
+    return model
+
+
 def build_datasets(data_cfg: DictConfig):
     train_ds = instantiate(data_cfg.train)
     if data_cfg.get("val") is None:

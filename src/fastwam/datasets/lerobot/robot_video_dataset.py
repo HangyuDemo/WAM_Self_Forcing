@@ -42,6 +42,7 @@ class RobotVideoDataset(torch.utils.data.Dataset):
         max_padding_retry: int = 3,
         concat_multi_camera: str = "horizontal", # "horizontal", "vertical", "robotwin", or None
         override_instruction: Optional[str] = None, # whether to hardcode a specific instruction for all samples, for debugging
+        return_multi_camera_video: bool = False,
     ):
         self.lerobot_dataset = BaseLerobotDataset(
             dataset_dirs=dataset_dirs,
@@ -72,6 +73,7 @@ class RobotVideoDataset(torch.utils.data.Dataset):
         self.max_padding_retry = max_padding_retry
         self.concat_multi_camera = concat_multi_camera
         self.override_instruction = override_instruction
+        self.return_multi_camera_video = return_multi_camera_video
 
         self.resize_transform = ResizeSmallestSideAspectPreserving(
             args={"img_w": self.video_size[1], "img_h": self.video_size[0]},
@@ -151,6 +153,45 @@ class RobotVideoDataset(torch.utils.data.Dataset):
         image_is_pad = image_is_pad[self.video_sample_indices]
 
         video = video.view(num_cameras, T_video, C, H, W)  # [num_cameras, T_video, C, H, W]
+
+        multi_camera_video = None
+        if self.return_multi_camera_video:
+            per_view_video = video
+            if self.concat_multi_camera == "robotwin":
+                if num_cameras != 3:
+                    raise ValueError(
+                        f"`concat_multi_camera='robotwin'` requires exactly 3 cameras, got {num_cameras}"
+                    )
+                top = transforms_F.resize(
+                    per_view_video[0],
+                    size=[256, 320],
+                    interpolation=transforms_F.InterpolationMode.BILINEAR,
+                    antialias=True,
+                )
+                left = transforms_F.resize(
+                    per_view_video[1],
+                    size=[128, 160],
+                    interpolation=transforms_F.InterpolationMode.BILINEAR,
+                    antialias=True,
+                )
+                right = transforms_F.resize(
+                    per_view_video[2],
+                    size=[128, 160],
+                    interpolation=transforms_F.InterpolationMode.BILINEAR,
+                    antialias=True,
+                )
+                left_right = torch.stack([left, right], dim=0)
+                per_view_video = torch.cat([top.unsqueeze(0), left_right], dim=0)
+
+            processed_views = []
+            for cam_idx in range(per_view_video.shape[0]):
+                cam_video = self.resize_transform(per_view_video[cam_idx])
+                cam_video = self.crop_transform(cam_video)
+                cam_video = self.normalize_transform(cam_video)
+                processed_views.append(cam_video)
+            multi_camera_video = torch.stack(processed_views, dim=0)  # [V, T, C, H, W]
+            multi_camera_video = multi_camera_video.permute(0, 2, 1, 3, 4)  # [V, C, T, H, W]
+
         if self.concat_multi_camera == "robotwin":
             if num_cameras != 3:
                 raise ValueError(
@@ -231,6 +272,8 @@ class RobotVideoDataset(torch.utils.data.Dataset):
             "action_is_pad": sample["action_is_pad"],
             "proprio_is_pad": sample["proprio_is_pad"],
         }
+        if multi_camera_video is not None:
+            data["multi_camera_video"] = multi_camera_video
         return data
 
     def _get_cached_text_context(self, prompt: str):

@@ -4,7 +4,7 @@
 #SBATCH --nodes=1
 #SBATCH --gres=gpu:nvidia_h100_80gb_hbm3:4
 #SBATCH --cpus-per-task=16
-#SBATCH --mem=256G
+#SBATCH --mem=512G
 #SBATCH --time=2-00:00:00
 #SBATCH --output=/home/ha865618/project/FastWAM/slurm_logs/%x-%j.out
 #SBATCH --error=/home/ha865618/project/FastWAM/slurm_logs/%x-%j.err
@@ -36,18 +36,19 @@ export CONTEXT_NOISE="${CONTEXT_NOISE:-0}"
 export RUN_ID="${RUN_ID:-idm_self_forcing_libero10_${SLURM_JOB_ID}}"
 export MASTER_PORT="${MASTER_PORT:-29621}"
 export PYTORCH_CUDA_ALLOC_CONF="${PYTORCH_CUDA_ALLOC_CONF:-expandable_segments:True}"
+export MODEL_CACHE_DIR="${MODEL_CACHE_DIR:-$(pwd)/checkpoints_idm_sf}"
 
 # Make conda-provided FFmpeg/pyav libraries visible to torchcodec when available.
 export LD_LIBRARY_PATH="${CONDA_PREFIX}/lib:${LD_LIBRARY_PATH:-}"
 export PATH="${CONDA_PREFIX}/bin:${PATH}"
 
-mkdir -p checkpoints
-export DIFFSYNTH_MODEL_BASE_PATH="${DIFFSYNTH_MODEL_BASE_PATH:-$(pwd)/checkpoints}"
+mkdir -p "${MODEL_CACHE_DIR}"
+export DIFFSYNTH_MODEL_BASE_PATH="${DIFFSYNTH_MODEL_BASE_PATH:-${MODEL_CACHE_DIR}}"
 
 echo "[1/3] preprocess action backbone"
 python scripts/preprocess_action_dit_backbone.py \
   --model-config configs/model/fastwam_idm.yaml \
-  --output checkpoints/ActionDiT_linear_interp_Wan22_alphascale_1024hdim.pt \
+  --output "${MODEL_CACHE_DIR}/ActionDiT_linear_interp_Wan22_alphascale_1024hdim.pt" \
   --device cuda \
   --dtype bfloat16
 
