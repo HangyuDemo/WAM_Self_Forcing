@@ -32,12 +32,20 @@ EVALUATION:
   num_inference_steps: ${eval_num_inference_steps}
   sigma_shift: null
   text_cfg_scale: 1.0
+  action_cfg_scale: 1.0
   negative_prompt: ""
   rand_device: cpu
   tiled: false
+  use_trainer_style_infer_api: null
+  sequence_sampling_mode: single_clip
+  sequence_num_clips: 1
+  sequence_stride: null
+  output_video_mode: pred_vae_gt
+  env_trial_index: 0
 
   # Optional external inputs
   dataset_stats_path: null
+  base_ckpt_path: null
   device: cuda
 
 MULTIRUN:

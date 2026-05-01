@@ -152,6 +152,51 @@ def _load_model_checkpoint(model: torch.nn.Module, ckpt: str) -> None:
     )
 
 
+def _is_video_lora_model_cfg(cfg: DictConfig) -> bool:
+    target = str(cfg.model.get("_target_", ""))
+    return target.endswith("create_fastwam_video_lora")
+
+
+def _read_base_ckpt_hint_from_checkpoint(ckpt: str) -> Optional[str]:
+    payload = torch.load(ckpt, map_location="cpu")
+    base_hint = payload.get("base_checkpoint_path_hint")
+    if base_hint is None:
+        return None
+    base_text = str(base_hint).strip()
+    return base_text or None
+
+
+def _load_eval_checkpoints(model: torch.nn.Module, cfg: DictConfig) -> None:
+    base_ckpt = cfg.EVALUATION.get("base_ckpt_path")
+    is_video_lora = _is_video_lora_model_cfg(cfg)
+    if is_video_lora:
+        logging.info(
+            "Detected FastWAM video-LoRA eval model. Matching training-time load order: "
+            "instantiate LoRA-wrapped model -> load base checkpoint -> load LoRA checkpoint."
+        )
+        if base_ckpt is None or str(base_ckpt).strip().lower() in {"", "none", "null"}:
+            hinted_base_ckpt = _read_base_ckpt_hint_from_checkpoint(str(cfg.ckpt))
+            if hinted_base_ckpt is None:
+                raise ValueError(
+                    "FastWAMVideoLoRA evaluation requires EVALUATION.base_ckpt_path to reproduce "
+                    "the training-time `base model + video LoRA` loading flow."
+                )
+            base_ckpt = hinted_base_ckpt
+            logging.info("Recovered base checkpoint path from LoRA checkpoint metadata: %s", base_ckpt)
+    if base_ckpt is not None and str(base_ckpt).strip().lower() not in {"", "none", "null"}:
+        _load_model_checkpoint(model, str(base_ckpt))
+        logging.info("Loaded base checkpoint for evaluation: %s", base_ckpt)
+    _load_model_checkpoint(model, str(cfg.ckpt))
+    logging.info("Loaded primary checkpoint for evaluation: %s", cfg.ckpt)
+
+
+def _should_use_trainer_style_infer_api(cfg: DictConfig) -> bool:
+    explicit = cfg.EVALUATION.get("use_trainer_style_infer_api")
+    if explicit is not None:
+        return bool(explicit)
+    return _is_video_lora_model_cfg(cfg)
+
+
 def _center_crop_resize(image: np.ndarray, width: int, height: int) -> np.ndarray:
     pil_image = Image.fromarray(image)
     src_w, src_h = pil_image.size
@@ -392,6 +437,7 @@ def _predict_action_chunk(
         "action_horizon": action_horizon,
         "negative_prompt": str(cfg.EVALUATION.get("negative_prompt", "")),
         "text_cfg_scale": float(cfg.EVALUATION.get("text_cfg_scale", 1.0)),
+        "action_cfg_scale": float(cfg.EVALUATION.get("action_cfg_scale", 1.0)),
         "num_inference_steps": num_inference_steps,
         "proprio": proprio,
         "sigma_shift": (
@@ -404,6 +450,8 @@ def _predict_action_chunk(
         "tiled": bool(cfg.EVALUATION.get("tiled", False)),
     }
     visualize_future_video = bool(cfg.EVALUATION.get("visualize_future_video", False))
+    force_joint_infer = bool(cfg.EVALUATION.get("force_joint_infer", False))
+    use_trainer_style_infer_api = _should_use_trainer_style_infer_api(cfg)
     predicted_future_frames = None
     if visualize_future_video:
         infer_kwargs["num_video_frames"] = _get_num_video_frames(cfg)
@@ -411,9 +459,32 @@ def _predict_action_chunk(
         infer_kwargs["num_video_frames"] = _get_num_video_frames(cfg)
 
     with torch.no_grad():
-        if visualize_future_video:
-            pred = model.infer_joint(**infer_kwargs)
-            predicted_future_frames = _select_predicted_future_frames(pred["video"], cfg)
+        if visualize_future_video or force_joint_infer:
+            if use_trainer_style_infer_api:
+                trainer_style_kwargs = {
+                    "prompt": infer_kwargs["prompt"],
+                    "input_image": infer_kwargs["input_image"],
+                    "num_frames": infer_kwargs["num_video_frames"],
+                    "action": None,
+                    "action_horizon": infer_kwargs["action_horizon"],
+                    "proprio": infer_kwargs["proprio"],
+                    "negative_prompt": infer_kwargs["negative_prompt"],
+                    "text_cfg_scale": infer_kwargs["text_cfg_scale"],
+                    "action_cfg_scale": infer_kwargs["action_cfg_scale"],
+                    "num_inference_steps": infer_kwargs["num_inference_steps"],
+                    "sigma_shift": infer_kwargs["sigma_shift"],
+                    "seed": infer_kwargs["seed"],
+                    "rand_device": infer_kwargs["rand_device"],
+                    "tiled": infer_kwargs["tiled"],
+                }
+                logging.info(
+                    "Using trainer-style online infer API (`model.infer`) for current eval model."
+                )
+                pred = model.infer(**trainer_style_kwargs)
+            else:
+                pred = model.infer_joint(**infer_kwargs)
+            if visualize_future_video:
+                predicted_future_frames = _select_predicted_future_frames(pred["video"], cfg)
         else:
             pred = model.infer_action(**infer_kwargs)
     action = pred["action"]  # [T, D]
@@ -503,7 +574,7 @@ def run_single_episode(
                 current_replan_idx += 1
                 current_predicted_future_clip = {
                     "replan_idx": current_replan_idx,
-                    "gt_frames": [imgs.copy()],
+                    "rollout_frames": [imgs.copy()],
                     "pred_frames": predicted_future_frames,
                 }
             else:
@@ -523,16 +594,16 @@ def run_single_episode(
         if visualize_future_video and current_predicted_future_clip is not None:
             current_replan_step += 1
             if current_replan_step in capture_steps:
-                current_predicted_future_clip["gt_frames"].append(get_libero_image(obs))
+                current_predicted_future_clip["rollout_frames"].append(get_libero_image(obs))
             if done or len(pending_actions) == 0:
                 expected_frame_count = 1 + sum(
                     1 for capture_step in capture_steps if capture_step <= current_replan_step
                 )
-                gt_len = len(current_predicted_future_clip["gt_frames"])
+                rollout_len = len(current_predicted_future_clip["rollout_frames"])
                 pred_len = len(current_predicted_future_clip["pred_frames"])
-                assert gt_len == expected_frame_count, (
-                    "GT future frames do not match expected capture count: "
-                    f"gt_len={gt_len} expected={expected_frame_count} "
+                assert rollout_len == expected_frame_count, (
+                    "Rollout future frames do not match expected capture count: "
+                    f"rollout_len={rollout_len} expected={expected_frame_count} "
                     f"episode={episode_idx} replan={current_predicted_future_clip['replan_idx']} "
                     f"current_replan_step={current_replan_step} capture_steps={sorted(capture_steps)}."
                 )
@@ -554,16 +625,16 @@ def run_single_episode(
                 current_predicted_future_clip["pred_frames"] = current_predicted_future_clip["pred_frames"][
                     :expected_frame_count
                 ]
-                assert len(current_predicted_future_clip["gt_frames"]) == len(
+                assert len(current_predicted_future_clip["rollout_frames"]) == len(
                     current_predicted_future_clip["pred_frames"]
                 ), (
-                    "GT/pred frame count mismatch after alignment: "
-                    f"len(gt_frames)={len(current_predicted_future_clip['gt_frames'])} "
+                    "Rollout/pred frame count mismatch after alignment: "
+                    f"len(rollout_frames)={len(current_predicted_future_clip['rollout_frames'])} "
                     f"len(pred_frames)={len(current_predicted_future_clip['pred_frames'])} "
                     f"episode={episode_idx} replan={current_predicted_future_clip['replan_idx']}."
                 )
                 clip_psnr = _compute_clip_mean_psnr(
-                    current_predicted_future_clip["gt_frames"],
+                    current_predicted_future_clip["rollout_frames"],
                     current_predicted_future_clip["pred_frames"],
                 )
                 if clip_psnr is not None:
@@ -645,22 +716,14 @@ def run_single_task(
                 )
             else:
                 all_gt_frames = []
+                all_rollout_frames = []
                 all_pred_frames = []
                 for clip in predicted_future_video_clips:
-                    all_gt_frames.extend(clip["gt_frames"])
+                    all_rollout_frames.extend(clip["rollout_frames"])
                     all_pred_frames.extend(clip["pred_frames"])
-                    save_prediction_video(
-                        predicted_video_dir,
-                        clip["gt_frames"],
-                        clip["pred_frames"],
-                        f"task{cfg.EVALUATION.task_id}_trial{trial_idx}",
-                        clip["replan_idx"],
-                        success=success,
-                        task_description=task_description,
-                    )
                 save_prediction_video(
                     predicted_video_dir,
-                    all_gt_frames,
+                    all_rollout_frames,
                     all_pred_frames,
                     f"task{cfg.EVALUATION.task_id}_trial{trial_idx}",
                     "all",
@@ -698,7 +761,7 @@ def eval_single_process(cfg: DictConfig):
     model_device = _resolve_eval_device(cfg)
     model_dtype = _mixed_precision_to_model_dtype(cfg.get("mixed_precision", "bf16"))
     model = instantiate(cfg.model, model_dtype=model_dtype, device=model_device)
-    _load_model_checkpoint(model, str(cfg.ckpt))
+    _load_eval_checkpoints(model, cfg)
     model = model.to(model_device).eval()
 
     dataset_stats_path = _resolve_dataset_stats_path(cfg)

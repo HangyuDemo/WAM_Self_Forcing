@@ -22,6 +22,9 @@ log_every: 10
 save_every: 100
 eval_every: 50
 eval_num_inference_steps: 10
+eval_num_video_samples: 1
+eval_video_sampling_mode: random
+eval_consecutive_stride: null
 
 # training
 gradient_accumulation_steps: 1

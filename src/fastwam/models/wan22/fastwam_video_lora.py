@@ -7,7 +7,7 @@ import torch
 from fastwam.utils.logging_config import get_logger
 
 from .fastwam_idm import FastWAMIDM
-from .lora import has_lora, inject_lora_linear_layers, iter_lora_modules, lora_state_dict
+from .lora import align_lora_dtype_device, has_lora, inject_lora_linear_layers, iter_lora_modules, lora_state_dict
 
 logger = get_logger(__name__)
 
@@ -18,6 +18,7 @@ class FastWAMVideoLoRA(FastWAMIDM):
     def __init__(self, *args, **kwargs):
         super().__init__(*args, **kwargs)
         self.video_lora_config: dict[str, Any] = {}
+        self.base_checkpoint_path_hint: Optional[str] = None
 
     def setup_video_lora(
         self,
@@ -123,6 +124,7 @@ class FastWAMVideoLoRA(FastWAMIDM):
         payload = {
             "video_expert_lora": lora_state_dict(self.video_expert),
             "video_lora_config": dict(self.video_lora_config),
+            "base_checkpoint_path_hint": self.base_checkpoint_path_hint,
             "step": step,
             "torch_dtype": str(self.torch_dtype),
         }
@@ -130,12 +132,83 @@ class FastWAMVideoLoRA(FastWAMIDM):
             payload["optimizer"] = optimizer.state_dict()
         torch.save(payload, path)
 
+    @staticmethod
+    def _remap_linear_keys_for_lora_wrapped_module(
+        state_dict: dict[str, torch.Tensor],
+        target_state_dict: dict[str, torch.Tensor],
+    ) -> dict[str, torch.Tensor]:
+        remapped: dict[str, torch.Tensor] = {}
+        for key, value in state_dict.items():
+            if key in target_state_dict:
+                remapped[key] = value
+                continue
+
+            mapped_key = None
+            if key.endswith(".weight"):
+                candidate = key[: -len(".weight")] + ".base.weight"
+                if candidate in target_state_dict:
+                    mapped_key = candidate
+            elif key.endswith(".bias"):
+                candidate = key[: -len(".bias")] + ".base.bias"
+                if candidate in target_state_dict:
+                    mapped_key = candidate
+
+            remapped[mapped_key or key] = value
+        return remapped
+
     def load_checkpoint(self, path, optimizer=None):
         payload = torch.load(path, map_location="cpu")
         if "video_expert_lora" not in payload:
-            return super().load_checkpoint(path, optimizer=optimizer)
+            if "mot" in payload:
+                target_state = self.mot.state_dict()
+                remapped = self._remap_linear_keys_for_lora_wrapped_module(payload["mot"], target_state)
+                missing, unexpected = self.mot.load_state_dict(remapped, strict=False)
+                logger.info(
+                    "Loaded base/full checkpoint into LoRA-wrapped MoT with strict=False. Missing=%d Unexpected=%d",
+                    len(missing),
+                    len(unexpected),
+                )
+            elif "dit" in payload:
+                logger.warning("Loading legacy `dit` checkpoint into video expert only.")
+                target_state = self.video_expert.state_dict()
+                remapped = self._remap_linear_keys_for_lora_wrapped_module(payload["dit"], target_state)
+                missing, unexpected = self.video_expert.load_state_dict(remapped, strict=False)
+                logger.info(
+                    "Loaded legacy video checkpoint into LoRA-wrapped video expert with strict=False. Missing=%d Unexpected=%d",
+                    len(missing),
+                    len(unexpected),
+                )
+            else:
+                raise ValueError(f"Checkpoint missing both `mot` and `video_expert_lora` keys: {path}")
 
-        self.video_expert.load_state_dict(payload["video_expert_lora"], strict=False)
+            if payload.get("base_checkpoint_path_hint") is not None:
+                self.base_checkpoint_path_hint = str(payload["base_checkpoint_path_hint"])
+            align_lora_dtype_device(self.video_expert)
+            if self.proprio_encoder is not None:
+                if "proprio_encoder" in payload:
+                    self.proprio_encoder.load_state_dict(payload["proprio_encoder"], strict=True)
+                else:
+                    logger.warning(
+                        "Checkpoint has no `proprio_encoder` weights; keeping current `proprio_encoder` params."
+                    )
+            elif "proprio_encoder" in payload:
+                logger.warning(
+                    "Checkpoint contains `proprio_encoder` weights but current model has `proprio_dim=None`; ignoring."
+                )
+
+            if optimizer is not None and "optimizer" in payload:
+                optimizer.load_state_dict(payload["optimizer"])
+            return payload
+
+        missing, unexpected = self.video_expert.load_state_dict(payload["video_expert_lora"], strict=False)
+        logger.info(
+            "Loaded video LoRA adapter into video expert with strict=False. Missing=%d Unexpected=%d",
+            len(missing),
+            len(unexpected),
+        )
+        if payload.get("base_checkpoint_path_hint") is not None:
+            self.base_checkpoint_path_hint = str(payload["base_checkpoint_path_hint"])
+        align_lora_dtype_device(self.video_expert)
         if optimizer is not None and "optimizer" in payload:
             optimizer.load_state_dict(payload["optimizer"])
         return payload

@@ -30,8 +30,12 @@ class LoRALinear(nn.Module):
 
         self.base.requires_grad_(False)
 
-        self.lora_A = nn.Parameter(torch.empty(self.rank, base_linear.in_features))
-        self.lora_B = nn.Parameter(torch.zeros(base_linear.out_features, self.rank))
+        param_kwargs = {
+            "device": base_linear.weight.device,
+            "dtype": base_linear.weight.dtype,
+        }
+        self.lora_A = nn.Parameter(torch.empty(self.rank, base_linear.in_features, **param_kwargs))
+        self.lora_B = nn.Parameter(torch.zeros(base_linear.out_features, self.rank, **param_kwargs))
         nn.init.kaiming_uniform_(self.lora_A, a=5**0.5)
 
     @property
@@ -132,6 +136,15 @@ def lora_state_dict(module: nn.Module) -> dict[str, torch.Tensor]:
 
 def has_lora(module: nn.Module) -> bool:
     return any(isinstance(submodule, LoRALinear) for submodule in module.modules())
+
+
+def align_lora_dtype_device(module: nn.Module) -> None:
+    for submodule in iter_lora_modules(module):
+        ref = submodule.base.weight
+        if submodule.lora_A.device != ref.device or submodule.lora_A.dtype != ref.dtype:
+            submodule.lora_A.data = submodule.lora_A.data.to(device=ref.device, dtype=ref.dtype)
+        if submodule.lora_B.device != ref.device or submodule.lora_B.dtype != ref.dtype:
+            submodule.lora_B.data = submodule.lora_B.data.to(device=ref.device, dtype=ref.dtype)
 
 
 @contextlib.contextmanager

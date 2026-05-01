@@ -43,6 +43,9 @@ class Wan22Trainer:
         self.save_every = int(cfg.save_every)
         self.eval_every = int(cfg.eval_every)
         self.eval_num_inference_steps = int(cfg.eval_num_inference_steps)
+        self.eval_num_video_samples = int(cfg.get("eval_num_video_samples", 1))
+        self.eval_video_sampling_mode = str(cfg.get("eval_video_sampling_mode", "random")).strip().lower()
+        self.eval_consecutive_stride = cfg.get("eval_consecutive_stride", None)
         self.gradient_accumulation_steps = int(cfg.gradient_accumulation_steps)
         self.max_grad_norm = float(cfg.max_grad_norm)
         self.seed = int(cfg.seed)
@@ -74,6 +77,11 @@ class Wan22Trainer:
             self.max_grad_norm,
         )
         logger.info("using accelerator.device=%s", self.accelerator.device)
+        if self.eval_video_sampling_mode not in {"random", "consecutive_same_episode"}:
+            raise ValueError(
+                f"Unsupported eval_video_sampling_mode={self.eval_video_sampling_mode}. "
+                "Expected one of: ['random', 'consecutive_same_episode']."
+            )
         worker_init_fn = set_global_seed(self.seed, get_worker_init_fn=True)
         self._assert_dataset_length_consistent(self.train_dataset, "train_dataset")
         if self.val_dataset is not None:
@@ -271,7 +279,10 @@ class Wan22Trainer:
         if not resume_path.exists():
             raise FileNotFoundError(f"Resume checkpoint not found: {resume}")
         logger.info("Loading weight checkpoint only: %s", resume)
-        self.accelerator.unwrap_model(self.model).load_checkpoint(str(resume_path), optimizer=None)
+        unwrapped_model = self.accelerator.unwrap_model(self.model)
+        if hasattr(unwrapped_model, "base_checkpoint_path_hint"):
+            unwrapped_model.base_checkpoint_path_hint = str(resume_path)
+        unwrapped_model.load_checkpoint(str(resume_path), optimizer=None)
         logger.warning("Loaded .pt weights only; optimizer/scheduler/step were not restored under ZeRO2.")
 
     def _set_dit_only_train_mode(self):
@@ -390,38 +401,103 @@ class Wan22Trainer:
             "action_horizon": action_horizon,
         }
 
-    @torch.no_grad()
-    def evaluate(self):
-        if self.val_dataset is None:
-            return None
+    def _resolve_eval_consecutive_stride(self) -> int:
+        if self.eval_consecutive_stride is not None:
+            stride = int(self.eval_consecutive_stride)
+            if stride < 1:
+                raise ValueError(f"`eval_consecutive_stride` must be >= 1, got {stride}")
+            return stride
 
-        model = self.accelerator.unwrap_model(self.model)
-        was_dit_training = model.dit.training
-        model.eval()
+        if self.val_dataset is not None and hasattr(self.val_dataset, "num_frames"):
+            num_frames = int(self.val_dataset.num_frames)
+            return max(num_frames - 1, 1)
 
-        # eval_index = (self.global_step + self.accelerator.process_index) % len(self.val_dataset)
-        rng = torch.Generator(device="cpu").manual_seed(self.global_step + self.accelerator.process_index)
-        eval_index = torch.randint(0, len(self.val_dataset), (1,), generator=rng).item()
-        sample = self._to_batched_eval_sample(self.val_dataset[eval_index])
+        return 1
 
-        # 1. training loss
+    def _sample_eval_indices(self, rng: torch.Generator, num_samples: int) -> list[int]:
+        num_samples = max(int(num_samples), 1)
+        if self.eval_video_sampling_mode == "random":
+            return [torch.randint(0, len(self.val_dataset), (1,), generator=rng).item() for _ in range(num_samples)]
+
+        base_dataset = getattr(self.val_dataset, "lerobot_dataset", None)
+        episode_data_index = getattr(base_dataset, "episode_data_index", None)
+        if episode_data_index is None:
+            logger.warning(
+                "Continuous eval requested, but val_dataset has no episode_data_index. Falling back to random sampling."
+            )
+            return [torch.randint(0, len(self.val_dataset), (1,), generator=rng).item() for _ in range(num_samples)]
+
+        stride = self._resolve_eval_consecutive_stride()
+        clip_num_frames = int(getattr(self.val_dataset, "num_frames", 1))
+        episode_from = episode_data_index["from"].tolist()
+        episode_to = episode_data_index["to"].tolist()
+        episode_perm = torch.randperm(len(episode_from), generator=rng).tolist()
+
+        for episode_idx in episode_perm:
+            ep_start = int(episode_from[episode_idx])
+            ep_end = int(episode_to[episode_idx])  # exclusive
+            max_first_start = ep_end - clip_num_frames - stride * (num_samples - 1)
+            if max_first_start < ep_start:
+                continue
+
+            if max_first_start == ep_start:
+                first_start = ep_start
+            else:
+                first_start = int(torch.randint(ep_start, max_first_start + 1, (1,), generator=rng).item())
+
+            indices = [first_start + i * stride for i in range(num_samples)]
+            logger.info(
+                "Continuous eval selected episode=%d first_start=%d stride=%d clip_num_frames=%d indices=%s",
+                episode_idx,
+                first_start,
+                stride,
+                clip_num_frames,
+                indices,
+            )
+            return indices
+
+        logger.warning(
+            "No episode is long enough for %d consecutive eval clips with stride=%d and clip_num_frames=%d. "
+            "Falling back to random sampling.",
+            num_samples,
+            stride,
+            clip_num_frames,
+        )
+        return [torch.randint(0, len(self.val_dataset), (1,), generator=rng).item() for _ in range(num_samples)]
+
+    def _save_triplet_video_tensor(self, stitched_video_tensor: torch.Tensor, video_path: str, fps: int = 8) -> str:
+        stitched_frames = []
+        for t in range(stitched_video_tensor.shape[1]):
+            frame = (stitched_video_tensor[:, t].permute(1, 2, 0).clamp(0.0, 1.0).numpy() * 255.0).astype(np.uint8)
+            stitched_frames.append(Image.fromarray(frame))
+        save_mp4(stitched_frames, video_path, fps=fps)
+        return video_path
+
+    def _evaluate_one_sample(
+        self,
+        model,
+        sample: dict,
+        eval_index: int,
+        *,
+        save_video: bool = True,
+        return_video_tensors: bool = False,
+    ) -> dict:
         with self.accelerator.autocast():
             val_loss, _ = model.training_loss(sample)
             val_loss = val_loss.float().item()
-        
+
         prompt = sample["prompt"][0]
-        video0 = sample["video"][0] # Tensor [3, T, H, W] in (-1, 1)
+        video0 = sample["video"][0]
         action = sample["action"][0] if "action" in sample and sample["action"] is not None else None
-        proprio = sample["proprio"][0, 0] if "proprio" in sample and sample["proprio"] is not None else None # from [1, T, d] to [d]
+        proprio = sample["proprio"][0, 0] if "proprio" in sample and sample["proprio"] is not None else None
         input_image = video0[:, 0].unsqueeze(0)
         _, num_frames, _, _ = video0.shape
 
-        # 2. inference and video saving
         infer_kwargs = {
             "input_image": input_image,
             "num_frames": num_frames,
             "action": action,
-            "action_horizon": sample['action_horizon'],
+            "action_horizon": sample["action_horizon"],
             "proprio": proprio,
             "text_cfg_scale": 1.0,
             "action_cfg_scale": 1.0,
@@ -436,17 +512,12 @@ class Wan22Trainer:
         else:
             infer_kwargs["prompt"] = prompt
 
-        pred = model.infer(
-            **infer_kwargs,
-        )
-        
+        pred = model.infer(**infer_kwargs)
         pred_video = pred["video"]
         pred_action = pred.get("action", None)
 
-        # 3. inference metrics against GT video
         pred_video_tensor = pil_frames_to_video_tensor(pred_video)
         gt_video_tensor = ((video0.detach().float().cpu().clamp(-1.0, 1.0) + 1.0) * 0.5).contiguous()
-
         assert pred_video_tensor.shape == gt_video_tensor.shape, (
             "Eval infer prediction/GT shape mismatch: "
             f"pred={tuple(pred_video_tensor.shape)} vs gt={tuple(gt_video_tensor.shape)}"
@@ -460,10 +531,8 @@ class Wan22Trainer:
         if action is not None and pred_action is not None:
             if sample["proprio"] is None:
                 raise ValueError("Eval sample must contain `proprio` for action denormalization.")
-            proprio = sample["proprio"].detach().to(device="cpu", dtype=torch.float32)
-            
+            proprio_full = sample["proprio"].detach().to(device="cpu", dtype=torch.float32)
             processor = self.val_dataset.lerobot_dataset.processor
-
             denorm_actions = {}
             action_meta = processor.shape_meta["action"]
             state_meta = processor.shape_meta["state"]
@@ -478,12 +547,8 @@ class Wan22Trainer:
                     raise ValueError(
                         f"{action_name} action must have shape [T, D] or [1, T, D], got {tuple(raw_action.shape)}"
                     )
-                action_btd = action_btd.detach().to(device="cpu", dtype=torch.float32)
-
-                batch = {
-                    "action": action_btd,
-                    "state": proprio,
-                }
+                action_btd = raw_action.detach().to(device="cpu", dtype=torch.float32)
+                batch = {"action": action_btd, "state": proprio_full}
                 batch = processor.action_state_merger.backward(batch)
                 batch = processor.normalizer.backward(batch)
                 merged_batch = {
@@ -491,31 +556,16 @@ class Wan22Trainer:
                     "state": {meta["key"]: batch["state"][meta["key"]].squeeze(0) for meta in state_meta},
                 }
                 merged_batch = processor.action_state_merger.forward(merged_batch)
-                denorm_action = merged_batch["action"].unsqueeze(0)
-                if denorm_action.ndim != 3 or denorm_action.shape[0] != 1:
-                    raise ValueError(
-                        f"Denormalized {action_name} action must have shape [1, T, D], got {tuple(denorm_action.shape)}"
-                    )
-                denorm_actions[action_name] = denorm_action
+                denorm_actions[action_name] = merged_batch["action"].unsqueeze(0)
 
-            pred_action_denorm = denorm_actions["pred"]
-            gt_action_denorm = denorm_actions["gt"]
-
-            if pred_action_denorm.shape != gt_action_denorm.shape:
-                raise ValueError(
-                    "Predicted action/GT action shape mismatch after denormalization: "
-                    f"pred={tuple(pred_action_denorm.shape)} vs gt={tuple(gt_action_denorm.shape)}"
-                )
-            action_diff = pred_action_denorm - gt_action_denorm
+            action_diff = denorm_actions["pred"] - denorm_actions["gt"]
             action_l1 = action_diff.abs().mean().item()
             action_l2 = action_diff.pow(2).mean().item()
 
-        # 4. VAE reconstruction metrics against GT video
         gt_video_batch = video0.unsqueeze(0).to(device=model.device, dtype=model.torch_dtype)
         vae_latents = model._encode_video_latents(gt_video_batch, tiled=False)
         vae_recon_video = model._decode_latents(vae_latents, tiled=False)
         vae_video_tensor = pil_frames_to_video_tensor(vae_recon_video)
-
         assert vae_video_tensor.shape == gt_video_tensor.shape, (
             "Eval VAE reconstruction/GT shape mismatch: "
             f"vae={tuple(vae_video_tensor.shape)} vs gt={tuple(gt_video_tensor.shape)}"
@@ -523,47 +573,103 @@ class Wan22Trainer:
 
         psnr_decode_vs_gt = video_psnr(pred=vae_video_tensor, target=gt_video_tensor)
         ssim_decode_vs_gt = video_ssim(pred=vae_video_tensor, target=gt_video_tensor)
-
         psnr_rollout_vs_decode = video_psnr(pred=pred_video_tensor, target=vae_video_tensor)
         ssim_rollout_vs_decode = video_ssim(pred=pred_video_tensor, target=vae_video_tensor)
 
-        stitched_video_tensor = torch.cat(
-            [pred_video_tensor, vae_video_tensor, gt_video_tensor],
-            dim=2,
-        ).contiguous()
-        stitched_frames = []
-        for t in range(stitched_video_tensor.shape[1]):
-            frame = (stitched_video_tensor[:, t].permute(1, 2, 0).clamp(0.0, 1.0).numpy() * 255.0).astype(np.uint8)
-            stitched_frames.append(Image.fromarray(frame))
+        stitched_video_tensor = torch.cat([pred_video_tensor, vae_video_tensor, gt_video_tensor], dim=2).contiguous()
+        video_path = None
+        if save_video:
+            video_path = os.path.join(
+                self.eval_dir,
+                f"step_{self.global_step:06d}_sample_{eval_index:06d}_rank_{self.accelerator.process_index:03d}.mp4",
+            )
+            self._save_triplet_video_tensor(stitched_video_tensor, video_path, fps=8)
 
-        video_path = os.path.join(
-            self.eval_dir,
-            f"step_{self.global_step:06d}_rank_{self.accelerator.process_index:03d}.mp4",
-        )
-        save_mp4(stitched_frames, video_path, fps=8)
+        result = {
+            "val_loss": float(val_loss),
+            "psnr_rg": float(psnr_rollout_vs_gt),
+            "ssim_rg": float(ssim_rollout_vs_gt),
+            "psnr_rd": float(psnr_rollout_vs_decode),
+            "ssim_rd": float(ssim_rollout_vs_decode),
+            "psnr_dg": float(psnr_decode_vs_gt),
+            "ssim_dg": float(ssim_decode_vs_gt),
+            "action_l2": None if action_l2 is None else float(action_l2),
+            "action_l1": None if action_l1 is None else float(action_l1),
+            "video_path": video_path,
+            "sample_index": int(eval_index),
+        }
+        if return_video_tensors:
+            result["pred_video_tensor"] = pred_video_tensor
+            result["vae_video_tensor"] = vae_video_tensor
+            result["gt_video_tensor"] = gt_video_tensor
+            result["stitched_video_tensor"] = stitched_video_tensor
+        return result
+
+    @torch.no_grad()
+    def evaluate(self):
+        if self.val_dataset is None:
+            return None
+
+        model = self.accelerator.unwrap_model(self.model)
+        was_dit_training = model.dit.training
+        model.eval()
+
+        rng = torch.Generator(device="cpu").manual_seed(self.global_step + self.accelerator.process_index)
+        sample_results = []
+        eval_indices = self._sample_eval_indices(rng, max(self.eval_num_video_samples, 1))
+        save_individual_videos = self.eval_video_sampling_mode != "consecutive_same_episode"
+        for eval_index in eval_indices:
+            sample = self._to_batched_eval_sample(self.val_dataset[eval_index])
+            sample_results.append(
+                self._evaluate_one_sample(
+                    model,
+                    sample,
+                    eval_index,
+                    save_video=save_individual_videos,
+                    return_video_tensors=not save_individual_videos,
+                )
+            )
 
         local_metrics = torch.tensor(
             [
-                float(val_loss),
-                float(psnr_rollout_vs_gt),
-                float(ssim_rollout_vs_gt),
-                float(psnr_rollout_vs_decode),
-                float(ssim_rollout_vs_decode),
-                float(psnr_decode_vs_gt),
-                float(ssim_decode_vs_gt),
-                float(action_l2) if action_l2 is not None else -1.0,
-                float(action_l1) if action_l1 is not None else -1.0,
+                [
+                    item["val_loss"],
+                    item["psnr_rg"],
+                    item["ssim_rg"],
+                    item["psnr_rd"],
+                    item["ssim_rd"],
+                    item["psnr_dg"],
+                    item["ssim_dg"],
+                    -1.0 if item["action_l2"] is None else item["action_l2"],
+                    -1.0 if item["action_l1"] is None else item["action_l1"],
+                ]
+                for item in sample_results
             ],
             device=self.accelerator.device,
             dtype=torch.float32,
-        ).unsqueeze(0)
+        )
         gathered_metrics = self.accelerator.gather_for_metrics(local_metrics)
         mean_metrics = gathered_metrics[:, :7].mean(dim=0)
-        action_l2_mean = gathered_metrics[:, 7].mean().item() if action_l2 is not None else None
-        action_l1_mean = gathered_metrics[:, 8].mean().item() if action_l1 is not None else None
+        action_l2_values = gathered_metrics[:, 7]
+        action_l1_values = gathered_metrics[:, 8]
+        action_l2_mean = action_l2_values[action_l2_values >= 0].mean().item() if bool((action_l2_values >= 0).any()) else None
+        action_l1_mean = action_l1_values[action_l1_values >= 0].mean().item() if bool((action_l1_values >= 0).any()) else None
 
         if was_dit_training:
             self._set_dit_only_train_mode()
+
+        combined_video_path = sample_results[0]["video_path"]
+        video_paths = [item["video_path"] for item in sample_results if item["video_path"] is not None]
+        if self.eval_video_sampling_mode == "consecutive_same_episode":
+            combined_tensor = torch.cat([item["stitched_video_tensor"] for item in sample_results], dim=1).contiguous()
+            first_idx = sample_results[0]["sample_index"]
+            last_idx = sample_results[-1]["sample_index"]
+            combined_video_path = os.path.join(
+                self.eval_dir,
+                f"step_{self.global_step:06d}_sequence_{first_idx:06d}_to_{last_idx:06d}_rank_{self.accelerator.process_index:03d}.mp4",
+            )
+            self._save_triplet_video_tensor(combined_tensor, combined_video_path, fps=8)
+            video_paths = [combined_video_path]
 
         result = {
             "val_loss": float(mean_metrics[0].item()),
@@ -573,7 +679,9 @@ class Wan22Trainer:
             "ssim_rd": float(mean_metrics[4].item()),
             "psnr_dg": float(mean_metrics[5].item()),
             "ssim_dg": float(mean_metrics[6].item()),
-            "video_path": video_path,
+            "video_path": combined_video_path,
+            "video_paths": video_paths,
+            "sample_indices": [item["sample_index"] for item in sample_results],
         }
         if action_l2_mean is not None:
             result["action_l2"] = float(action_l2_mean)

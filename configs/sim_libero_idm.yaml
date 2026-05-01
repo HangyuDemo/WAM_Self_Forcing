@@ -1,0 +1,13 @@
+# @package _global_
+
+defaults:
+  - sim_libero
+  - override /task: libero10_only_idm_2cam224_1e-4
+  - _self_
+
+EVALUATION:
+  # IDM-specific: force joint inference path so action generation always follows
+  # "predict video first -> condition action" pipeline in FastWAMIDM.infer_joint.
+  force_joint_infer: true
+  output_dir: ./evaluate_results/libero_idm/${hydra:runtime.choices.task}/${now:%Y%m%d_%H%M%S}
+

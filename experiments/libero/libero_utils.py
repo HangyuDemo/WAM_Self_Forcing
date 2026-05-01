@@ -85,7 +85,7 @@ def save_rollout_video(rollout_dir, rollout_images, idx, success, task_descripti
 
 def save_prediction_video(
     rollout_dir,
-    gt_frames,
+    rollout_frames,
     pred_frames,
     idx,
     replan_idx,
@@ -94,23 +94,23 @@ def save_prediction_video(
     log_file=None,
     fps=8,
 ):
-    """Saves an MP4 comparison of ground-truth and predicted future frames for one replanning clip."""
-    num_frames = min(len(gt_frames), len(pred_frames))
+    """Saves an MP4 comparison of simulation rollout and predicted future frames for one replanning clip."""
+    num_frames = min(len(rollout_frames), len(pred_frames))
     if num_frames <= 0:
-        raise ValueError("Cannot save prediction video with empty GT/pred frame lists.")
+        raise ValueError("Cannot save prediction video with empty rollout/pred frame lists.")
 
     stitched_frames = []
-    for gt_frame, pred_frame in zip(gt_frames[:num_frames], pred_frames[:num_frames]):
-        if isinstance(gt_frame, dict):
-            gt_images = []
-            for value in gt_frame.values():
+    for rollout_frame, pred_frame in zip(rollout_frames[:num_frames], pred_frames[:num_frames]):
+        if isinstance(rollout_frame, dict):
+            rollout_images = []
+            for value in rollout_frame.values():
                 value_array = np.array(value) if isinstance(value, Image.Image) else value.copy()
-                gt_images.append(value_array)
-            gt_image = np.concatenate(gt_images, axis=1)
-        elif isinstance(gt_frame, Image.Image):
-            gt_image = np.array(gt_frame.convert("RGB"))
+                rollout_images.append(value_array)
+            rollout_image = np.concatenate(rollout_images, axis=1)
+        elif isinstance(rollout_frame, Image.Image):
+            rollout_image = np.array(rollout_frame.convert("RGB"))
         else:
-            gt_image = np.array(gt_frame)
+            rollout_image = np.array(rollout_frame)
 
         if isinstance(pred_frame, Image.Image):
             pred_image = np.array(pred_frame.convert("RGB"))
@@ -118,17 +118,17 @@ def save_prediction_video(
             pred_image = np.array(pred_frame)
 
         target_h, target_w = pred_image.shape[:2]
-        if gt_image.shape[:2] != (target_h, target_w):
-            gt_image = np.array(
-                Image.fromarray(gt_image).resize((target_w, target_h), resample=Image.BILINEAR)
+        if rollout_image.shape[:2] != (target_h, target_w):
+            rollout_image = np.array(
+                Image.fromarray(rollout_image).resize((target_w, target_h), resample=Image.BILINEAR)
             )
 
-        gt_pil = Image.fromarray(gt_image)
-        ImageDraw.Draw(gt_pil).text((10, 10), "gt", fill=(255, 255, 255))
+        rollout_pil = Image.fromarray(rollout_image)
+        ImageDraw.Draw(rollout_pil).text((10, 10), "rollout", fill=(255, 255, 255))
         pred_pil = Image.fromarray(pred_image)
         ImageDraw.Draw(pred_pil).text((10, 10), "pred", fill=(255, 255, 255))
         stitched_frames.append(
-            Image.fromarray(np.concatenate([np.array(pred_pil), np.array(gt_pil)], axis=0))
+            Image.fromarray(np.concatenate([np.array(pred_pil), np.array(rollout_pil)], axis=0))
         )
 
     processed_task_description = task_description.lower().replace(" ", "_").replace("\n", "_").replace(".", "_")[:50]
@@ -138,12 +138,12 @@ def save_prediction_video(
         replan_tag = str(replan_idx)
     mp4_path = (
         f"{rollout_dir}/{DATE_TIME}--episode={idx}--success={success}"
-        f"--task={processed_task_description}--replan={replan_tag}--gt-pred.mp4"
+        f"--task={processed_task_description}--replan={replan_tag}--rollout-pred.mp4"
     )
     save_mp4(stitched_frames, mp4_path, fps=fps)
-    print(f"Saved predicted future comparison MP4 at path {mp4_path}")
+    print(f"Saved predicted-vs-rollout MP4 at path {mp4_path}")
     if log_file is not None:
-        log_file.write(f"Saved predicted future comparison MP4 at path {mp4_path}\n")
+        log_file.write(f"Saved predicted-vs-rollout MP4 at path {mp4_path}\n")
     return mp4_path
 
 def binarize_gripper_open(open_val: np.ndarray | float) -> np.ndarray:

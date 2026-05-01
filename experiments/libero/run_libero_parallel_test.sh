@@ -27,8 +27,13 @@ run_libero_eval() {
     SESSION_NAME="libero_test_v3"
     EXP_NAME=${EXP_NAME:-""}
     export EXP_NAME
+    PYTHON_BIN=${PYTHON_BIN:-python}
+    export PYTHON_BIN
+    EVAL_SINGLE_SCRIPT=${EVAL_SINGLE_SCRIPT:-"experiments/libero/eval_libero_single.py"}
+    export EVAL_SINGLE_SCRIPT
 
     echo "EXP_NAME: $EXP_NAME"
+    echo "PYTHON_BIN: $PYTHON_BIN"
     
     # Create the output directory
     mkdir -p "$OUTPUT_DIR"
@@ -258,6 +263,7 @@ run_libero_eval() {
     echo "ROOT_DIR: $ROOT_DIR"
     echo "NUM_GPUS: $NUM_GPUS"
     echo "MAX_TASKS_PER_GPU: $MAX_TASKS_PER_GPU"
+    echo "EVAL_SINGLE_SCRIPT: $EVAL_SINGLE_SCRIPT"
     
     # Initialize GPU load tracking
     init_gpu_load_tracking
@@ -337,7 +343,7 @@ run_libero_eval() {
         tmux send-keys -t $SESSION_NAME:$pane_info "clear" C-m 2>/dev/null
         tmux send-keys -t $SESSION_NAME:$pane_info "source ~/.bashrc && cd $ROOT_DIR && export EXP_NAME=$EXP_NAME && \
             STATUS_FILE='$status_file' LOG_FILE='$log_file' RESULT_FILE='$result_file' && \
-            CUDA_VISIBLE_DEVICES=$gpu_id python experiments/libero/eval_libero_single.py \
+            CUDA_VISIBLE_DEVICES=$gpu_id \"$PYTHON_BIN\" $EVAL_SINGLE_SCRIPT \
             task=$CONFIG ckpt=$CKPT \
             EVALUATION.task_suite_name=$suite EVALUATION.task_id=$task_id gpu_id=$gpu_id \
             EVALUATION.num_trials=$NUM_TRIALS EVALUATION.output_dir=$OUTPUT_DIR $EXTRA_ARGS > \"\$LOG_FILE\" 2>&1; \
@@ -623,9 +629,6 @@ run_libero_eval() {
 
     # Check the final result
     echo "All tasks completed successfully!"
-    # Run the result summarization script
-    echo "Generating evaluation report..."
-    python experiments/libero/summarize_results.py --output_dir="$OUTPUT_DIR"
 }
 
 
