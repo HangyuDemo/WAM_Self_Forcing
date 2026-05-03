@@ -1,0 +1,9 @@
+# @package _global_
+
+defaults:
+  - train
+  - override /task: libero10_idm_proprio_joint_2cam224_1e-4
+  - _self_
+
+wandb:
+  name: train_idm_proprio_joint

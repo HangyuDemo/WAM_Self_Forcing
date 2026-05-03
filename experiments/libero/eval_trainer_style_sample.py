@@ -9,7 +9,7 @@ import hydra
 import numpy as np
 import torch
 from hydra.utils import instantiate
-from omegaconf import DictConfig, OmegaConf
+from omegaconf import DictConfig, OmegaConf, open_dict
 from PIL import Image
 from libero.libero import benchmark
 
@@ -19,8 +19,11 @@ if str(project_root) not in sys.path:
 
 from experiments.libero.eval_libero_single import (
     _denormalize_action,
+    _get_future_frame_capture_steps,
+    _get_max_steps,
     _load_eval_checkpoints,
     _mixed_precision_to_model_dtype,
+    _predict_action_chunk,
     _resolve_dataset_stats_path,
 )
 from experiments.libero.libero_utils import (
@@ -29,7 +32,10 @@ from experiments.libero.libero_utils import (
     get_libero_env,
     get_libero_image,
     invert_gripper_action,
+    save_prediction_video,
 )
+from fastwam.datasets.lerobot.processors.fastwam_processor import FastWAMProcessor
+from fastwam.datasets.lerobot.utils.normalizer import load_dataset_stats_from_json
 from fastwam.trainer import Wan22Trainer
 from fastwam.utils.logging_config import setup_logging
 from fastwam.utils import misc
@@ -47,6 +53,14 @@ def _build_eval_dataset(cfg: DictConfig):
     train_cfg["is_training_set"] = True
     dataset = instantiate(train_cfg)
     return dataset, dataset_stats_path
+
+
+def _build_eval_processor(cfg: DictConfig) -> tuple[FastWAMProcessor, Path]:
+    dataset_stats_path = _resolve_dataset_stats_path(cfg)
+    processor: FastWAMProcessor = instantiate(cfg.data.train.processor).eval()
+    dataset_stats = load_dataset_stats_from_json(str(dataset_stats_path))
+    processor.set_normalizer_from_stats(dataset_stats)
+    return processor, dataset_stats_path
 
 
 def _select_eval_index(dataset, cfg: DictConfig) -> int:
@@ -68,10 +82,10 @@ def _resolve_sequence_cfg(dataset, cfg: DictConfig) -> tuple[str, int, int]:
     if num_clips < 1:
         raise ValueError(f"EVALUATION.sequence_num_clips must be >= 1, got {num_clips}")
 
-    if mode not in {"single_clip", "consecutive_same_episode"}:
+    if mode not in {"single_clip", "consecutive_same_episode", "full_episode_same_episode"}:
         raise ValueError(
             f"Unsupported EVALUATION.sequence_sampling_mode={mode}. "
-            "Expected one of: ['single_clip', 'consecutive_same_episode']."
+            "Expected one of: ['single_clip', 'consecutive_same_episode', 'full_episode_same_episode']."
         )
 
     stride = cfg.EVALUATION.get("sequence_stride")
@@ -98,12 +112,28 @@ def _find_episode_bounds(base_dataset, sample_index: int) -> tuple[int, int, int
 def _select_eval_indices(dataset, cfg: DictConfig) -> list[int]:
     mode, num_clips, stride = _resolve_sequence_cfg(dataset, cfg)
     first_index = _select_eval_index(dataset, cfg)
-    if mode == "single_clip" or num_clips == 1:
+    if mode == "single_clip" or (mode != "full_episode_same_episode" and num_clips == 1):
         return [first_index]
 
     base_dataset = dataset.lerobot_dataset
     clip_num_frames = int(getattr(dataset, "num_frames", 1))
     explicit_index = cfg.EVALUATION.get("sample_index")
+
+    if mode == "full_episode_same_episode":
+        episode_id, ep_start, ep_end = _find_episode_bounds(base_dataset, first_index)
+        max_first_start = ep_end - clip_num_frames
+        if max_first_start < ep_start:
+            raise ValueError(
+                f"Episode {episode_id} is shorter than one clip: "
+                f"ep_start={ep_start} ep_end={ep_end} clip_num_frames={clip_num_frames}."
+            )
+        indices = list(range(ep_start, max_first_start + 1, stride))
+        if len(indices) == 0:
+            raise ValueError(
+                f"Failed to build full-episode clip indices for episode {episode_id} "
+                f"with stride={stride}."
+            )
+        return indices
 
     if explicit_index is not None:
         episode_id, ep_start, ep_end = _find_episode_bounds(base_dataset, first_index)
@@ -188,68 +218,6 @@ def _get_action_video_freq_ratio(dataset) -> int:
     return ratio
 
 
-def _capture_rollout_frames_for_action_sequence(
-    pred_action: torch.Tensor,
-    *,
-    processor,
-    task_suite_name: str,
-    task_id: int,
-    trial_index: int,
-    num_steps_wait: int,
-    binarize_gripper: bool,
-    expected_num_video_frames: int,
-    action_video_freq_ratio: int,
-) -> tuple[list[dict[str, np.ndarray]], dict[str, Any]]:
-    benchmark_dict = benchmark.get_benchmark_dict()
-    task_suite = benchmark_dict[task_suite_name]()
-    task = task_suite.get_task(task_id)
-    initial_states = task_suite.get_task_init_states(task_id)
-    if len(initial_states) == 0:
-        raise ValueError(f"No initial states found for {task_suite_name} task_id={task_id}")
-    trial_index = int(trial_index) % len(initial_states)
-    initial_state = initial_states[trial_index]
-
-    env, task_description = get_libero_env(task, LIBERO_ENV_RESOLUTION, seed=0)
-    try:
-        env.reset()
-        obs = env.set_init_state(initial_state)
-        for _ in range(int(num_steps_wait)):
-            obs, _, _, _ = env.step(get_libero_dummy_action())
-
-        action_np = _denormalize_action(pred_action, processor)[0]
-        action_np[..., -1] = action_np[..., -1] * 2 - 1
-        action_np = invert_gripper_action(action_np)
-        if binarize_gripper:
-            action_np[..., -1] = np.sign(action_np[..., -1])
-
-        rollout_frames = [get_libero_image(obs)]
-        capture_steps = {
-            min(step_idx * action_video_freq_ratio, action_np.shape[0])
-            for step_idx in range(1, expected_num_video_frames)
-        }
-        capture_steps.discard(0)
-
-        done = False
-        for step_idx, action_step in enumerate(action_np, start=1):
-            obs, _, done, _ = env.step(action_step.tolist())
-            if step_idx in capture_steps:
-                rollout_frames.append(get_libero_image(obs))
-            if done:
-                break
-
-        while len(rollout_frames) < expected_num_video_frames:
-            rollout_frames.append(get_libero_image(obs))
-
-        return rollout_frames[:expected_num_video_frames], {
-            "task_description": task_description,
-            "trial_index": trial_index,
-            "done": bool(done),
-            "action_steps_executed": int(min(len(action_np), step_idx if len(action_np) > 0 else 0)),
-        }
-    finally:
-        env.close()
-
-
 def _save_two_row_video(pred_video_tensor: torch.Tensor, rollout_frames: list[Any], path: Path, fps: int) -> None:
     rollout_frame_tensors = []
     target_h = int(pred_video_tensor.shape[2])
@@ -287,6 +255,144 @@ def _save_two_row_video(pred_video_tensor: torch.Tensor, rollout_frames: list[An
         frame = (stitched_video_tensor[:, t].permute(1, 2, 0).clamp(0.0, 1.0).numpy() * 255.0).astype(np.uint8)
         stitched_frames.append(Image.fromarray(frame))
     save_mp4(stitched_frames, str(path), fps=fps)
+
+
+def _run_closed_loop_pred_rollout(
+    model: torch.nn.Module,
+    processor: FastWAMProcessor,
+    cfg: DictConfig,
+    *,
+    output_dir: Path,
+    model_device: str,
+) -> dict[str, Any]:
+    benchmark_dict = benchmark.get_benchmark_dict()
+    task_suite = benchmark_dict[str(cfg.EVALUATION.task_suite_name)]()
+    task_id = int(cfg.EVALUATION.task_id)
+    task = task_suite.get_task(task_id)
+    initial_states = task_suite.get_task_init_states(task_id)
+    if len(initial_states) == 0:
+        raise ValueError(f"No initial states found for {cfg.EVALUATION.task_suite_name} task_id={task_id}")
+
+    trial_index = int(cfg.EVALUATION.get("env_trial_index", 0)) % len(initial_states)
+    initial_state = initial_states[trial_index]
+    task_description = task.language
+
+    action_horizon_cfg = cfg.EVALUATION.get("action_horizon", None)
+    if action_horizon_cfg is None:
+        action_horizon = int(cfg.data.train.num_frames) - 1
+    else:
+        action_horizon = int(action_horizon_cfg)
+    if action_horizon <= 0:
+        raise ValueError(f"EVALUATION.action_horizon must be positive, got {action_horizon}")
+
+    video_size = cfg.data.train.get("video_size", [224, 224])
+    if len(video_size) != 2:
+        raise ValueError(f"data.train.video_size must be [H, W], got {video_size}")
+    input_h = int(video_size[0])
+    input_w = int(video_size[1])
+
+    max_steps = _get_max_steps(str(cfg.EVALUATION.task_suite_name))
+    replan_steps = int(cfg.EVALUATION.get("replan_steps", 10))
+    num_steps_wait = int(cfg.EVALUATION.get("num_steps_wait", 30))
+    capture_steps = set(_get_future_frame_capture_steps(cfg)[1:])
+
+    env, _ = get_libero_env(task, LIBERO_ENV_RESOLUTION, seed=0)
+    try:
+        env.reset()
+        obs = env.set_init_state(initial_state)
+        for _ in range(num_steps_wait):
+            obs, _, _, _ = env.step(get_libero_dummy_action())
+
+        all_rollout_frames: list[Any] = []
+        all_pred_frames: list[Any] = []
+        pending_actions: list[list[float]] = []
+        current_predicted_future_clip: dict[str, Any] | None = None
+        current_replan_step = 0
+        current_replan_idx = -1
+        replan_count = 0
+        t = 0
+        done = False
+
+        while t < max_steps:
+            if len(pending_actions) == 0:
+                action_chunk, imgs, predicted_future_frames = _predict_action_chunk(
+                    obs=obs,
+                    task_description=task_description,
+                    model=model,
+                    processor=processor,
+                    cfg=cfg,
+                    action_horizon=action_horizon,
+                    input_w=input_w,
+                    input_h=input_h,
+                    model_device=model_device,
+                )
+                if predicted_future_frames is None:
+                    raise ValueError(
+                        "Closed-loop pred_rollout mode requires predicted future video frames. "
+                        "Please keep EVALUATION.visualize_future_video=true."
+                    )
+                current_replan_idx += 1
+                replan_count += 1
+                current_predicted_future_clip = {
+                    "replan_idx": current_replan_idx,
+                    "rollout_frames": [imgs.copy()],
+                    "pred_frames": predicted_future_frames,
+                }
+                current_replan_step = 0
+                pending_actions = action_chunk[:replan_steps].tolist()
+
+            obs, _, done, _ = env.step(pending_actions.pop(0))
+            if current_predicted_future_clip is not None:
+                current_replan_step += 1
+                if current_replan_step in capture_steps:
+                    current_predicted_future_clip["rollout_frames"].append(get_libero_image(obs))
+                if done or len(pending_actions) == 0:
+                    expected_frame_count = 1 + sum(
+                        1 for capture_step in capture_steps if capture_step <= current_replan_step
+                    )
+                    current_predicted_future_clip["pred_frames"] = current_predicted_future_clip["pred_frames"][
+                        :expected_frame_count
+                    ]
+                    current_predicted_future_clip["rollout_frames"] = current_predicted_future_clip["rollout_frames"][
+                        :expected_frame_count
+                    ]
+                    if len(current_predicted_future_clip["pred_frames"]) != len(current_predicted_future_clip["rollout_frames"]):
+                        raise ValueError(
+                            "Closed-loop rollout/pred frame count mismatch: "
+                            f"pred={len(current_predicted_future_clip['pred_frames'])} "
+                            f"rollout={len(current_predicted_future_clip['rollout_frames'])}."
+                        )
+                    all_rollout_frames.extend(current_predicted_future_clip["rollout_frames"])
+                    all_pred_frames.extend(current_predicted_future_clip["pred_frames"])
+                    current_predicted_future_clip = None
+            if done:
+                break
+            t += 1
+
+        video_path = Path(
+            save_prediction_video(
+                str(output_dir),
+                all_rollout_frames,
+                all_pred_frames,
+                f"task{task_id}_trial{trial_index}",
+                "closedloop",
+                success=bool(done),
+                task_description=task_description,
+                fps=int(cfg.EVALUATION.get("fps", 8)),
+            )
+        )
+        return {
+            "video_path": str(video_path),
+            "rollout_task_description": task_description,
+            "rollout_done": bool(done),
+            "env_trial_index": int(trial_index),
+            "rollout_action_steps_executed": int(t),
+            "replan_count": int(replan_count),
+            "num_pred_frames": int(len(all_pred_frames)),
+            "num_rollout_frames": int(len(all_rollout_frames)),
+        }
+    finally:
+        env.close()
 
 
 def _evaluate_clip(model, dataset, sample_index: int, cfg: DictConfig) -> dict[str, Any]:
@@ -399,9 +505,6 @@ def main(cfg: DictConfig):
     _load_eval_checkpoints(model, cfg)
     model = model.to(model_device).eval()
 
-    dataset, dataset_stats_path = _build_eval_dataset(cfg)
-    sample_indices = _select_eval_indices(dataset, cfg)
-    clip_results = [_evaluate_clip(model, dataset, sample_index, cfg) for sample_index in sample_indices]
     output_video_mode = str(cfg.EVALUATION.get("output_video_mode", "pred_vae_gt")).strip().lower()
     if output_video_mode not in {"pred_vae_gt", "pred_rollout"}:
         raise ValueError(
@@ -409,49 +512,49 @@ def main(cfg: DictConfig):
             "Expected one of: ['pred_vae_gt', 'pred_rollout']."
         )
 
+    if output_video_mode == "pred_rollout":
+        with open_dict(cfg):
+            cfg.EVALUATION.visualize_future_video = True
+        processor, dataset_stats_path = _build_eval_processor(cfg)
+        rollout_metrics = _run_closed_loop_pred_rollout(
+            model=model,
+            processor=processor,
+            cfg=cfg,
+            output_dir=output_dir,
+            model_device=model_device,
+        )
+        metrics = {
+            "dataset_stats_path": str(dataset_stats_path),
+            "base_ckpt_path": cfg.EVALUATION.get("base_ckpt_path"),
+            "ckpt": str(cfg.ckpt),
+            "output_video_mode": output_video_mode,
+            "rollout_task_suite_name": str(cfg.EVALUATION.task_suite_name),
+            "rollout_task_id": int(cfg.EVALUATION.task_id),
+        }
+        metrics.update(rollout_metrics)
+        metrics_path = output_dir / "closedloop--metrics.json"
+        _save_metrics_json(metrics, metrics_path)
+        print(json.dumps(metrics, ensure_ascii=True, indent=2))
+        return
+
+    dataset, dataset_stats_path = _build_eval_dataset(cfg)
+    sample_indices = _select_eval_indices(dataset, cfg)
+    clip_results = [_evaluate_clip(model, dataset, sample_index, cfg) for sample_index in sample_indices]
+    _, _, resolved_sequence_stride = _resolve_sequence_cfg(dataset, cfg)
+
     if len(clip_results) == 1:
         base_name = f"sample_{clip_results[0]['sample_index']:06d}"
     else:
         base_name = f"sequence_{clip_results[0]['sample_index']:06d}_to_{clip_results[-1]['sample_index']:06d}"
 
-    rollout_meta = None
-    if output_video_mode == "pred_vae_gt":
-        stitched_video_tensor = torch.cat([item["stitched_video_tensor"] for item in clip_results], dim=1).contiguous()
-        stitched_frames = []
-        for t in range(stitched_video_tensor.shape[1]):
-            frame = (stitched_video_tensor[:, t].permute(1, 2, 0).clamp(0.0, 1.0).numpy() * 255.0).astype(np.uint8)
-            stitched_frames.append(Image.fromarray(frame))
+    stitched_video_tensor = torch.cat([item["stitched_video_tensor"] for item in clip_results], dim=1).contiguous()
+    stitched_frames = []
+    for t in range(stitched_video_tensor.shape[1]):
+        frame = (stitched_video_tensor[:, t].permute(1, 2, 0).clamp(0.0, 1.0).numpy() * 255.0).astype(np.uint8)
+        stitched_frames.append(Image.fromarray(frame))
 
-        video_path = output_dir / f"{base_name}--pred-vae-gt.mp4"
-        save_mp4(stitched_frames, str(video_path), fps=int(cfg.EVALUATION.get("fps", 8)))
-    else:
-        if len(clip_results) != 1:
-            raise ValueError(
-                "EVALUATION.output_video_mode=pred_rollout currently supports a single clip only. "
-                "Please set EVALUATION.sequence_num_clips=1."
-            )
-        pred_action = clip_results[0]["pred_action"]
-        pred_video_tensor = clip_results[0]["pred_video_tensor"]
-        if pred_action is None:
-            raise ValueError("Model did not return `pred_action`, so pred_rollout video cannot be created.")
-        rollout_frames, rollout_meta = _capture_rollout_frames_for_action_sequence(
-            pred_action=pred_action,
-            processor=dataset.lerobot_dataset.processor,
-            task_suite_name=str(cfg.EVALUATION.task_suite_name),
-            task_id=int(cfg.EVALUATION.task_id),
-            trial_index=int(cfg.EVALUATION.get("env_trial_index", 0)),
-            num_steps_wait=int(cfg.EVALUATION.get("num_steps_wait", 30)),
-            binarize_gripper=bool(cfg.EVALUATION.get("binarize_gripper", True)),
-            expected_num_video_frames=int(pred_video_tensor.shape[1]),
-            action_video_freq_ratio=_get_action_video_freq_ratio(dataset),
-        )
-        video_path = output_dir / f"{base_name}--pred-rollout.mp4"
-        _save_two_row_video(
-            pred_video_tensor=pred_video_tensor,
-            rollout_frames=rollout_frames,
-            path=video_path,
-            fps=int(cfg.EVALUATION.get("fps", 8)),
-        )
+    video_path = output_dir / f"{base_name}--pred-vae-gt.mp4"
+    save_mp4(stitched_frames, str(video_path), fps=int(cfg.EVALUATION.get("fps", 8)))
 
     metric_keys = ["val_loss", "psnr_rg", "ssim_rg", "psnr_rd", "ssim_rd", "psnr_dg", "ssim_dg"]
     metrics = {
@@ -465,18 +568,11 @@ def main(cfg: DictConfig):
         "action_horizon": clip_results[0]["action_horizon"],
         "num_clips": len(clip_results),
         "sequence_sampling_mode": str(cfg.EVALUATION.get("sequence_sampling_mode", "single_clip")),
-        "sequence_stride": int(cfg.EVALUATION.get("sequence_stride", max(int(getattr(dataset, "num_frames", 1)) - 1, 1))),
+        "sequence_stride": int(resolved_sequence_stride),
         "output_video_mode": output_video_mode,
         "video_path": str(video_path),
         "clip_metrics": [],
     }
-    if rollout_meta is not None:
-        metrics["env_trial_index"] = int(cfg.EVALUATION.get("env_trial_index", 0))
-        metrics["rollout_task_suite_name"] = str(cfg.EVALUATION.task_suite_name)
-        metrics["rollout_task_id"] = int(cfg.EVALUATION.task_id)
-        metrics["rollout_done"] = bool(rollout_meta["done"])
-        metrics["rollout_action_steps_executed"] = int(rollout_meta["action_steps_executed"])
-        metrics["rollout_task_description"] = rollout_meta["task_description"]
     for key in metric_keys:
         metrics[key] = float(np.mean([item[key] for item in clip_results]))
 
