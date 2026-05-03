@@ -547,7 +547,7 @@ class Wan22Trainer:
                     raise ValueError(
                         f"{action_name} action must have shape [T, D] or [1, T, D], got {tuple(raw_action.shape)}"
                     )
-                action_btd = raw_action.detach().to(device="cpu", dtype=torch.float32)
+                action_btd = action_btd.detach().to(device="cpu", dtype=torch.float32)
                 batch = {"action": action_btd, "state": proprio_full}
                 batch = processor.action_state_merger.backward(batch)
                 batch = processor.normalizer.backward(batch)

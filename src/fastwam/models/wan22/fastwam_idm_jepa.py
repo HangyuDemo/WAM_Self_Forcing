@@ -32,6 +32,7 @@ class FastWAMIDMJEPA(FastWAMIDM):
         freeze_encoder: bool = True,
         pool_mode: str = "mean",
         predict_future_only: bool = True,
+        feature_dim_multiplier: int = 1,
     ) -> None:
         try:
             from transformers import AutoModel, AutoVideoProcessor
@@ -52,6 +53,10 @@ class FastWAMIDMJEPA(FastWAMIDM):
             self.jepa_encoder.eval()
 
         jepa_hidden_dim = int(getattr(self.jepa_encoder.config, "hidden_size"))
+        feature_dim_multiplier = int(feature_dim_multiplier)
+        if feature_dim_multiplier <= 0:
+            raise ValueError(f"`feature_dim_multiplier` must be positive, got {feature_dim_multiplier}")
+        jepa_target_dim = int(jepa_hidden_dim * feature_dim_multiplier)
         video_hidden_dim = int(getattr(self.video_expert, "hidden_dim"))
 
         # Keep trainable heads inside self.dit (MoT), so trainer optimizer picks them up.
@@ -59,18 +64,19 @@ class FastWAMIDMJEPA(FastWAMIDM):
             nn.LayerNorm(video_hidden_dim),
             nn.Linear(video_hidden_dim, video_hidden_dim),
             nn.GELU(),
-            nn.Linear(video_hidden_dim, jepa_hidden_dim),
+            nn.Linear(video_hidden_dim, jepa_target_dim),
         ).to(device=self.device, dtype=self.torch_dtype)
 
         self.dit.jepa_action_ctx_proj = nn.Sequential(
-            nn.LayerNorm(jepa_hidden_dim),
-            nn.Linear(jepa_hidden_dim, self.text_dim),
+            nn.LayerNorm(jepa_target_dim),
+            nn.Linear(jepa_target_dim, self.text_dim),
         ).to(device=self.device, dtype=self.torch_dtype)
 
         logger.info(
-            "Initialized JEPA branch: model_id=%s, hidden=%d, pool_mode=%s, future_only=%s",
+            "Initialized JEPA branch: model_id=%s, hidden=%d, target_dim=%d, pool_mode=%s, future_only=%s",
             self.jepa_model_id,
             jepa_hidden_dim,
+            jepa_target_dim,
             self.jepa_pool_mode,
             self.jepa_predict_future_only,
         )

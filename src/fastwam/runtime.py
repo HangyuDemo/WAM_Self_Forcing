@@ -430,6 +430,7 @@ def create_fastwam_idm_jepa(
         freeze_encoder=bool(jepa.get("freeze_encoder", True)),
         pool_mode=str(jepa.get("pool_mode", "mean")),
         predict_future_only=bool(jepa.get("predict_future_only", True)),
+        feature_dim_multiplier=int(jepa.get("feature_dim_multiplier", 1)),
     )
     return model
 

@@ -64,3 +64,6 @@ jepa:
   freeze_encoder: true
   pool_mode: mean
   predict_future_only: true
+  # Multiview JEPA target concatenates view features on the channel dim.
+  # For libero_10_2cam, each step target dim is 2 * hidden_size.
+  feature_dim_multiplier: ${data.train.processor.num_output_cameras}
