@@ -295,6 +295,7 @@ def _self_forcing_training_loss(self, sample, tiled: bool = False):
     action = inputs["action"]
     action_is_pad = inputs["action_is_pad"]
     fuse_flag = inputs["fuse_vae_embedding_in_latents"]
+    enable_proprio_joint = bool(getattr(self, "enable_proprio_joint", False))
 
     chunk_size = int(getattr(self, "sf_video_chunk_size", 3))
     rollout_steps = int(getattr(self, "sf_video_rollout_steps", 4))
@@ -456,10 +457,55 @@ def _self_forcing_training_loss(self, sample, tiled: bool = False):
     loss_action = (action_loss_per_sample * action_weight).mean()
 
     loss_total = self.loss_lambda_video * loss_video + self.loss_lambda_action * loss_action
-    return loss_total, {
+    loss_dict = {
         "loss_video_self_forcing": self.loss_lambda_video * float(loss_video.detach().item()),
         "loss_action_generated_video_cond": self.loss_lambda_action * float(loss_action.detach().item()),
     }
+    if enable_proprio_joint:
+        train_prop_scheduler = getattr(self, "train_proprio_scheduler", None)
+        pred_fn = getattr(self, "_predict_proprio_noise", None)
+        target_builder = getattr(self, "_build_proprio_target_sequence", None)
+        if train_prop_scheduler is None or not callable(pred_fn) or not callable(target_builder):
+            raise RuntimeError(
+                "Self-forcing proprio-joint is enabled, but required model hooks are missing. "
+                "Use `FastWAMIDMProprioJoint` with `setup_proprio_joint_prediction(...)`."
+            )
+
+        target_proprio_clean = target_builder(sample=sample, latent_t=int(generated_video.shape[2]))
+        if target_proprio_clean is None:
+            raise ValueError(
+                "Self-forcing proprio-joint requires `sample['future_proprio']` or `sample['proprio']`."
+            )
+        noise_proprio = torch.randn_like(target_proprio_clean)
+        timestep_proprio = train_prop_scheduler.sample_training_t(
+            batch_size=batch_size,
+            device=self.device,
+            dtype=target_proprio_clean.dtype,
+        )
+        noisy_proprio = train_prop_scheduler.add_noise(target_proprio_clean, noise_proprio, timestep_proprio)
+        target_proprio = train_prop_scheduler.training_target(
+            target_proprio_clean,
+            noise_proprio,
+            timestep_proprio,
+        )
+        pred_proprio = pred_fn(
+            latents_proprio=noisy_proprio,
+            timestep_proprio=timestep_proprio,
+            context=context,
+            context_mask=context_mask,
+        )
+
+        proprio_loss_token = F.mse_loss(pred_proprio.float(), target_proprio.float(), reduction="none").mean(dim=2)
+        proprio_loss_per_sample = proprio_loss_token.mean(dim=1)
+        proprio_weight = train_prop_scheduler.training_weight(timestep_proprio).to(
+            proprio_loss_per_sample.device, dtype=proprio_loss_per_sample.dtype
+        )
+        loss_proprio = (proprio_loss_per_sample * proprio_weight).mean()
+        lambda_proprio = float(getattr(self, "loss_lambda_proprio", 1.0))
+        loss_total = loss_total + lambda_proprio * loss_proprio
+        loss_dict["loss_proprio_joint"] = lambda_proprio * float(loss_proprio.detach().item())
+
+    return loss_total, loss_dict
 
 
 def run_self_forcing_training(cfg: DictConfig):
