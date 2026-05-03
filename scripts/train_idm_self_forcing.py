@@ -463,9 +463,15 @@ def _self_forcing_training_loss(self, sample, tiled: bool = False):
     }
     if enable_proprio_joint:
         train_prop_scheduler = getattr(self, "train_proprio_scheduler", None)
+        infer_prop_scheduler = getattr(self, "infer_proprio_scheduler", None)
         pred_fn = getattr(self, "_predict_proprio_noise", None)
         target_builder = getattr(self, "_build_proprio_target_sequence", None)
-        if train_prop_scheduler is None or not callable(pred_fn) or not callable(target_builder):
+        if (
+            train_prop_scheduler is None
+            or infer_prop_scheduler is None
+            or not callable(pred_fn)
+            or not callable(target_builder)
+        ):
             raise RuntimeError(
                 "Self-forcing proprio-joint is enabled, but required model hooks are missing. "
                 "Use `FastWAMIDMProprioJoint` with `setup_proprio_joint_prediction(...)`."
@@ -476,34 +482,78 @@ def _self_forcing_training_loss(self, sample, tiled: bool = False):
             raise ValueError(
                 "Self-forcing proprio-joint requires `sample['future_proprio']` or `sample['proprio']`."
             )
-        noise_proprio = torch.randn_like(target_proprio_clean)
-        timestep_proprio = train_prop_scheduler.sample_training_t(
-            batch_size=batch_size,
-            device=self.device,
+
+        prop_timesteps, prop_deltas = infer_prop_scheduler.build_inference_schedule(
+            num_inference_steps=rollout_steps,
+            device=target_proprio_clean.device,
             dtype=target_proprio_clean.dtype,
         )
-        noisy_proprio = train_prop_scheduler.add_noise(target_proprio_clean, noise_proprio, timestep_proprio)
-        target_proprio = train_prop_scheduler.training_target(
-            target_proprio_clean,
-            noise_proprio,
-            timestep_proprio,
-        )
-        pred_proprio = pred_fn(
-            latents_proprio=noisy_proprio,
-            timestep_proprio=timestep_proprio,
-            context=context,
-            context_mask=context_mask,
-        )
+        proprio_losses = []
+        generated_prop_chunks = []
+        num_prop_frames = int(target_proprio_clean.shape[1])
 
-        proprio_loss_token = F.mse_loss(pred_proprio.float(), target_proprio.float(), reduction="none").mean(dim=2)
-        proprio_loss_per_sample = proprio_loss_token.mean(dim=1)
-        proprio_weight = train_prop_scheduler.training_weight(timestep_proprio).to(
-            proprio_loss_per_sample.device, dtype=proprio_loss_per_sample.dtype
+        for frame_start in range(0, num_prop_frames, chunk_size):
+            frame_end = min(frame_start + chunk_size, num_prop_frames)
+            gt_prop_chunk = target_proprio_clean[:, frame_start:frame_end, :]
+            current_prop = torch.randn_like(gt_prop_chunk)
+
+            if frame_start == 0:
+                current_prop[:, 0:1, :] = target_proprio_clean[:, 0:1, :]
+            else:
+                current_prop[:, 0:1, :] = generated_prop_chunks[-1][:, -1:, :]
+
+            exit_idx = int(torch.randint(0, rollout_steps, (1,), device=target_proprio_clean.device).item())
+            for step_idx in range(exit_idx):
+                timestep_prop = prop_timesteps[step_idx].expand(batch_size)
+                with torch.no_grad():
+                    pred_prop = pred_fn(
+                        latents_proprio=current_prop,
+                        timestep_proprio=timestep_prop,
+                        context=context,
+                        context_mask=context_mask,
+                    )
+                    if frame_start == 0:
+                        pred_prop[:, 0:1, :] = 0
+                    current_prop = infer_prop_scheduler.step(pred_prop, prop_deltas[step_idx], current_prop)
+                    if frame_start == 0:
+                        current_prop[:, 0:1, :] = target_proprio_clean[:, 0:1, :]
+                    else:
+                        current_prop[:, 0:1, :] = generated_prop_chunks[-1][:, -1:, :]
+
+            timestep_prop = prop_timesteps[exit_idx].expand(batch_size)
+            pred_prop = pred_fn(
+                latents_proprio=current_prop,
+                timestep_proprio=timestep_prop,
+                context=context,
+                context_mask=context_mask,
+            )
+            sigma_prop = (timestep_prop / float(train_prop_scheduler.num_train_timesteps)).to(
+                current_prop.device, dtype=current_prop.dtype
+            ).view(batch_size, 1, 1).clamp(min=1e-4)
+            target_prop = (current_prop - gt_prop_chunk) / sigma_prop
+
+            if frame_start == 0:
+                pred_prop_loss = pred_prop[:, 1:, :]
+                target_prop_loss = target_prop[:, 1:, :]
+            else:
+                pred_prop_loss = pred_prop[:, 1:, :]
+                target_prop_loss = target_prop[:, 1:, :]
+            if pred_prop_loss.numel() > 0:
+                proprio_losses.append(F.mse_loss(pred_prop_loss.float(), target_prop_loss.float()))
+
+            clean_prop_chunk = (current_prop - sigma_prop * pred_prop).detach()
+            if frame_start == 0:
+                clean_prop_chunk[:, 0:1, :] = target_proprio_clean[:, 0:1, :]
+            else:
+                clean_prop_chunk[:, 0:1, :] = generated_prop_chunks[-1][:, -1:, :]
+            generated_prop_chunks.append(clean_prop_chunk)
+
+        loss_proprio = (
+            torch.stack(proprio_losses).mean() if proprio_losses else target_proprio_clean.sum() * 0.0
         )
-        loss_proprio = (proprio_loss_per_sample * proprio_weight).mean()
         lambda_proprio = float(getattr(self, "loss_lambda_proprio", 1.0))
         loss_total = loss_total + lambda_proprio * loss_proprio
-        loss_dict["loss_proprio_joint"] = lambda_proprio * float(loss_proprio.detach().item())
+        loss_dict["loss_proprio_joint_self_forcing"] = lambda_proprio * float(loss_proprio.detach().item())
 
     return loss_total, loss_dict
 
