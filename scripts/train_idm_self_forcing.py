@@ -536,8 +536,8 @@ def _self_forcing_training_loss(self, sample, tiled: bool = False):
                 pred_prop_loss = pred_prop[:, 1:, :]
                 target_prop_loss = target_prop[:, 1:, :]
             else:
-                pred_prop_loss = pred_prop[:, 1:, :]
-                target_prop_loss = target_prop[:, 1:, :]
+                pred_prop_loss = pred_prop
+                target_prop_loss = target_prop
             if pred_prop_loss.numel() > 0:
                 proprio_losses.append(F.mse_loss(pred_prop_loss.float(), target_prop_loss.float()))
 
