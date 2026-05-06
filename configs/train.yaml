@@ -24,6 +24,7 @@ eval_every: 50
 eval_num_inference_steps: 10
 eval_num_video_samples: 1
 eval_video_sampling_mode: random
+eval_concat_video_segments: 5
 eval_consecutive_stride: null
 
 # training

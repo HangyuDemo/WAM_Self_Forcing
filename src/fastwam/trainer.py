@@ -45,6 +45,7 @@ class Wan22Trainer:
         self.eval_num_inference_steps = int(cfg.eval_num_inference_steps)
         self.eval_num_video_samples = int(cfg.get("eval_num_video_samples", 1))
         self.eval_video_sampling_mode = str(cfg.get("eval_video_sampling_mode", "random")).strip().lower()
+        self.eval_concat_video_segments = int(cfg.get("eval_concat_video_segments", 5))
         self.eval_consecutive_stride = cfg.get("eval_consecutive_stride", None)
         self.gradient_accumulation_steps = int(cfg.gradient_accumulation_steps)
         self.max_grad_norm = float(cfg.max_grad_norm)
@@ -81,6 +82,10 @@ class Wan22Trainer:
             raise ValueError(
                 f"Unsupported eval_video_sampling_mode={self.eval_video_sampling_mode}. "
                 "Expected one of: ['random', 'consecutive_same_episode']."
+            )
+        if self.eval_concat_video_segments <= 0:
+            raise ValueError(
+                f"`eval_concat_video_segments` must be positive, got {self.eval_concat_video_segments}."
             )
         worker_init_fn = set_global_seed(self.seed, get_worker_init_fn=True)
         self._assert_dataset_length_consistent(self.train_dataset, "train_dataset")
@@ -616,7 +621,10 @@ class Wan22Trainer:
 
         rng = torch.Generator(device="cpu").manual_seed(self.global_step + self.accelerator.process_index)
         sample_results = []
-        eval_indices = self._sample_eval_indices(rng, max(self.eval_num_video_samples, 1))
+        num_eval_clips = max(self.eval_num_video_samples, 1)
+        if self.eval_video_sampling_mode == "consecutive_same_episode":
+            num_eval_clips = max(num_eval_clips, self.eval_concat_video_segments)
+        eval_indices = self._sample_eval_indices(rng, num_eval_clips)
         save_individual_videos = self.eval_video_sampling_mode != "consecutive_same_episode"
         for eval_index in eval_indices:
             sample = self._to_batched_eval_sample(self.val_dataset[eval_index])
@@ -661,9 +669,13 @@ class Wan22Trainer:
         combined_video_path = sample_results[0]["video_path"]
         video_paths = [item["video_path"] for item in sample_results if item["video_path"] is not None]
         if self.eval_video_sampling_mode == "consecutive_same_episode":
-            combined_tensor = torch.cat([item["stitched_video_tensor"] for item in sample_results], dim=1).contiguous()
+            concat_count = min(self.eval_concat_video_segments, len(sample_results))
+            combined_tensor = torch.cat(
+                [item["stitched_video_tensor"] for item in sample_results[:concat_count]],
+                dim=1,
+            ).contiguous()
             first_idx = sample_results[0]["sample_index"]
-            last_idx = sample_results[-1]["sample_index"]
+            last_idx = sample_results[concat_count - 1]["sample_index"]
             combined_video_path = os.path.join(
                 self.eval_dir,
                 f"step_{self.global_step:06d}_sequence_{first_idx:06d}_to_{last_idx:06d}_rank_{self.accelerator.process_index:03d}.mp4",
