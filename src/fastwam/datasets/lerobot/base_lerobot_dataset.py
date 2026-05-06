@@ -48,7 +48,10 @@ class BaseLerobotDataset(torch.utils.data.Dataset):
         metas = []
         for ds_dir in dataset_dirs:
             ds_root = Path(ds_dir)
-            repo_id = ds_dir
+            # For local datasets, passing the absolute path as `repo_id` can make
+            # downstream LeRobot utilities treat it like a Hugging Face repo name.
+            # Keep the full path in `root`, and use a compact local identifier here.
+            repo_id = ds_root.name if ds_root.exists() else ds_dir
             meta = LeRobotDatasetMetadata(repo_id=repo_id, root=ds_root)
             metas.append(meta)
 
@@ -87,19 +90,19 @@ class BaseLerobotDataset(torch.utils.data.Dataset):
 
         episodes = {}
         if val_set_proportion < 1e-6:
-            for meta in metas:
-                episodes.update({meta.repo_id: list(range(meta.total_episodes))})
+            for ds_dir, meta in zip(dataset_dirs, metas):
+                episodes.update({ds_dir: list(range(meta.total_episodes))})
         else:
-            for meta in metas:
+            for ds_dir, meta in zip(dataset_dirs, metas):
                 split_idx = int(meta.total_episodes * (1 - val_set_proportion))
                 # random shuffle episode indices before splitting
                 episode_indices = list(range(meta.total_episodes))
                 rng = np.random.default_rng(seed)
                 rng.shuffle(episode_indices)
                 if self.is_training_set:
-                    episodes.update({meta.repo_id: [episode_indices[i] for i in range(split_idx)]})
+                    episodes.update({ds_dir: [episode_indices[i] for i in range(split_idx)]})
                 else:
-                    episodes.update({meta.repo_id: [episode_indices[i] for i in range(split_idx, meta.total_episodes)]})
+                    episodes.update({ds_dir: [episode_indices[i] for i in range(split_idx, meta.total_episodes)]})
 
         self.multi_dataset = MultiLeRobotDataset(
             dataset_dirs=self.dataset_dirs,

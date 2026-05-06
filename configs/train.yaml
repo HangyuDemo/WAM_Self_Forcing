@@ -26,6 +26,13 @@ eval_num_video_samples: 1
 eval_video_sampling_mode: random
 eval_concat_video_segments: 5
 eval_consecutive_stride: null
+eval_output_video_mode: pred_vae_gt
+eval_rollout_task_suite_name: null
+eval_rollout_task_id: 0
+eval_rollout_env_trial_index: 0
+eval_replan_steps: 10
+eval_num_steps_wait: 30
+eval_binarize_gripper: false
 
 # training
 gradient_accumulation_steps: 1

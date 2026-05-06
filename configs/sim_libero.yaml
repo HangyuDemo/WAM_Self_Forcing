@@ -41,7 +41,10 @@ EVALUATION:
   sequence_num_clips: 1
   sequence_stride: null
   output_video_mode: pred_vae_gt
+  pred_rollout_source: online
   env_trial_index: 0
+  sample_index: null
+  sample_seed: null
 
   # Optional external inputs
   dataset_stats_path: null

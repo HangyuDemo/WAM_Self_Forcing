@@ -47,6 +47,13 @@ class Wan22Trainer:
         self.eval_video_sampling_mode = str(cfg.get("eval_video_sampling_mode", "random")).strip().lower()
         self.eval_concat_video_segments = int(cfg.get("eval_concat_video_segments", 5))
         self.eval_consecutive_stride = cfg.get("eval_consecutive_stride", None)
+        self.eval_output_video_mode = str(cfg.get("eval_output_video_mode", "pred_vae_gt")).strip().lower()
+        self.eval_rollout_task_suite_name = cfg.get("eval_rollout_task_suite_name", None)
+        self.eval_rollout_task_id = int(cfg.get("eval_rollout_task_id", 0))
+        self.eval_rollout_env_trial_index = int(cfg.get("eval_rollout_env_trial_index", 0))
+        self.eval_replan_steps = int(cfg.get("eval_replan_steps", 10))
+        self.eval_num_steps_wait = int(cfg.get("eval_num_steps_wait", 30))
+        self.eval_binarize_gripper = bool(cfg.get("eval_binarize_gripper", False))
         self.gradient_accumulation_steps = int(cfg.gradient_accumulation_steps)
         self.max_grad_norm = float(cfg.max_grad_norm)
         self.seed = int(cfg.seed)
@@ -86,6 +93,11 @@ class Wan22Trainer:
         if self.eval_concat_video_segments <= 0:
             raise ValueError(
                 f"`eval_concat_video_segments` must be positive, got {self.eval_concat_video_segments}."
+            )
+        if self.eval_output_video_mode not in {"pred_vae_gt", "local_init_then_online_rollout"}:
+            raise ValueError(
+                f"Unsupported eval_output_video_mode={self.eval_output_video_mode}. "
+                "Expected one of: ['pred_vae_gt', 'local_init_then_online_rollout']."
             )
         worker_init_fn = set_global_seed(self.seed, get_worker_init_fn=True)
         self._assert_dataset_length_consistent(self.train_dataset, "train_dataset")
@@ -478,6 +490,217 @@ class Wan22Trainer:
         save_mp4(stitched_frames, video_path, fps=fps)
         return video_path
 
+    def _run_local_init_then_online_rollout_eval(self, model, eval_index: int) -> dict:
+        from libero.libero import benchmark
+        from experiments.libero.eval_libero_single import (
+            _denormalize_action,
+            _get_future_frame_capture_steps,
+            _get_max_steps,
+            _predict_action_chunk,
+            _select_predicted_future_frames,
+        )
+        from experiments.libero.libero_utils import (
+            LIBERO_ENV_RESOLUTION,
+            get_libero_dummy_action,
+            get_libero_env,
+            get_libero_image,
+            invert_gripper_action,
+            save_prediction_video,
+        )
+
+        if self.val_dataset is None:
+            raise ValueError("val_dataset is required for local_init_then_online_rollout eval mode.")
+        if self.eval_rollout_task_suite_name in (None, "", "null"):
+            raise ValueError(
+                "`eval_rollout_task_suite_name` must be set when eval_output_video_mode=local_init_then_online_rollout."
+            )
+
+        sample = self._to_batched_eval_sample(self.val_dataset[eval_index])
+        base_metrics = self._evaluate_one_sample(
+            model,
+            sample,
+            eval_index,
+            save_video=False,
+            return_video_tensors=False,
+        )
+
+        prompt = sample["prompt"][0]
+        video0 = sample["video"][0]
+        proprio = sample["proprio"][0, 0] if sample["proprio"] is not None else None
+        input_image = video0[:, 0].unsqueeze(0)
+        _, num_frames, _, _ = video0.shape
+
+        infer_kwargs = {
+            "input_image": input_image,
+            "num_frames": num_frames,
+            "action": None,
+            "action_horizon": sample["action_horizon"],
+            "proprio": proprio,
+            "text_cfg_scale": 1.0,
+            "action_cfg_scale": 1.0,
+            "num_inference_steps": self.eval_num_inference_steps,
+            "seed": self.seed,
+            "rand_device": "cpu",
+            "tiled": False,
+        }
+        if sample["context"] is not None:
+            infer_kwargs["prompt"] = None
+            infer_kwargs["context"] = sample["context"][0]
+            infer_kwargs["context_mask"] = sample["context_mask"][0]
+        else:
+            infer_kwargs["prompt"] = prompt
+
+        with torch.no_grad():
+            pred = model.infer(**infer_kwargs)
+
+        first_pred_frames = _select_predicted_future_frames(
+            pred["video"],
+            type(
+                "EvalCfgShim",
+                (),
+                {
+                    "EVALUATION": {"replan_steps": self.eval_replan_steps},
+                    "data": type("DataShim", (), {"train": type("TrainShim", (), {"action_video_freq_ratio": self.val_dataset.action_video_freq_ratio})()})(),
+                },
+            )(),
+        )
+        pred_action = pred.get("action", None)
+        if pred_action is None:
+            raise ValueError("Training rollout eval requires model.infer(...) to return `action`.")
+
+        denorm_action = _denormalize_action(pred_action, self.val_dataset.lerobot_dataset.processor)[0]
+        denorm_action[..., -1] = denorm_action[..., -1] * 2 - 1
+        denorm_action = invert_gripper_action(denorm_action)
+        if self.eval_binarize_gripper:
+            denorm_action[..., -1] = np.sign(denorm_action[..., -1])
+
+        benchmark_dict = benchmark.get_benchmark_dict()
+        task_suite = benchmark_dict[str(self.eval_rollout_task_suite_name)]()
+        task = task_suite.get_task(self.eval_rollout_task_id)
+        initial_states = task_suite.get_task_init_states(self.eval_rollout_task_id)
+        if len(initial_states) == 0:
+            raise ValueError(
+                f"No initial states found for {self.eval_rollout_task_suite_name} task_id={self.eval_rollout_task_id}"
+            )
+        trial_index = self.eval_rollout_env_trial_index % len(initial_states)
+        initial_state = initial_states[trial_index]
+        task_description = task.language
+
+        processor = self.val_dataset.lerobot_dataset.processor
+        video_size = getattr(self.val_dataset, "video_size", [224, 224])
+        input_h = int(video_size[0])
+        input_w = int(video_size[1])
+        model_device = str(model.device) if hasattr(model, "device") else str(next(model.parameters()).device)
+        capture_steps = set(_get_future_frame_capture_steps(type(
+            "EvalCfgShim",
+            (),
+            {
+                "EVALUATION": {"replan_steps": self.eval_replan_steps},
+                "data": type("DataShim", (), {"train": type("TrainShim", (), {"action_video_freq_ratio": self.val_dataset.action_video_freq_ratio, "num_frames": self.val_dataset.num_frames})()})(),
+            },
+        )())[1:])
+
+        env, _ = get_libero_env(task, LIBERO_ENV_RESOLUTION, seed=0)
+        all_rollout_frames = []
+        all_pred_frames = []
+        pending_actions = np.asarray(denorm_action, dtype=np.float32)[: self.eval_replan_steps].tolist()
+        current_predicted_future_clip = {
+            "rollout_frames": [],
+            "pred_frames": list(first_pred_frames),
+        }
+        replan_count = 1
+        current_replan_step = 0
+        total_action_steps = 0
+        done = False
+
+        try:
+            env.reset()
+            obs = env.set_init_state(initial_state)
+            for _ in range(self.eval_num_steps_wait):
+                obs, _, _, _ = env.step(get_libero_dummy_action())
+            current_predicted_future_clip["rollout_frames"] = [get_libero_image(obs)]
+
+            while total_action_steps < _get_max_steps(str(self.eval_rollout_task_suite_name)):
+                if len(pending_actions) == 0:
+                    cfg_shim = type(
+                        "EvalCfgShim",
+                        (),
+                        {
+                            "EVALUATION": {
+                                "num_inference_steps": self.eval_num_inference_steps,
+                                "negative_prompt": "",
+                                "text_cfg_scale": 1.0,
+                                "action_cfg_scale": 1.0,
+                                "sigma_shift": None,
+                                "seed": self.seed,
+                                "rand_device": "cpu",
+                                "tiled": False,
+                                "visualize_future_video": True,
+                                "force_joint_infer": True,
+                                "binarize_gripper": self.eval_binarize_gripper,
+                                "replan_steps": self.eval_replan_steps,
+                                "use_trainer_style_infer_api": True,
+                            },
+                            "data": type("DataShim", (), {"train": type("TrainShim", (), {"action_video_freq_ratio": self.val_dataset.action_video_freq_ratio, "num_frames": self.val_dataset.num_frames})()})(),
+                            "model": type("ModelShim", (), {"video_dit_config": {"action_conditioned": False}})(),
+                            "get": lambda self_, key, default=None: {"seed": self.seed, "eval_num_inference_steps": self.eval_num_inference_steps}.get(key, default),
+                        },
+                    )()
+                    action_chunk, imgs, predicted_future_frames = _predict_action_chunk(
+                        obs=obs,
+                        task_description=task_description,
+                        model=model,
+                        processor=processor,
+                        cfg=cfg_shim,
+                        action_horizon=int(sample["action_horizon"]),
+                        input_w=input_w,
+                        input_h=input_h,
+                        model_device=model_device,
+                    )
+                    current_predicted_future_clip = {
+                        "rollout_frames": [imgs.copy()],
+                        "pred_frames": predicted_future_frames,
+                    }
+                    current_replan_step = 0
+                    pending_actions = action_chunk[: self.eval_replan_steps].tolist()
+                    replan_count += 1
+
+                obs, _, done, _ = env.step(pending_actions.pop(0))
+                total_action_steps += 1
+                current_replan_step += 1
+                if current_replan_step in capture_steps:
+                    current_predicted_future_clip["rollout_frames"].append(get_libero_image(obs))
+                if done or len(pending_actions) == 0:
+                    expected_frame_count = 1 + sum(1 for capture_step in capture_steps if capture_step <= current_replan_step)
+                    current_predicted_future_clip["pred_frames"] = current_predicted_future_clip["pred_frames"][:expected_frame_count]
+                    current_predicted_future_clip["rollout_frames"] = current_predicted_future_clip["rollout_frames"][:expected_frame_count]
+                    all_pred_frames.extend(current_predicted_future_clip["pred_frames"])
+                    all_rollout_frames.extend(current_predicted_future_clip["rollout_frames"])
+                    current_predicted_future_clip = {"rollout_frames": [], "pred_frames": []}
+                if done:
+                    break
+
+            video_path = save_prediction_video(
+                self.eval_dir,
+                all_rollout_frames,
+                all_pred_frames,
+                f"step_{self.global_step:06d}_sample_{eval_index:06d}_rank_{self.accelerator.process_index:03d}",
+                "trainrollout",
+                success=bool(done),
+                task_description=task_description,
+                fps=8,
+            )
+        finally:
+            env.close()
+
+        base_metrics["video_path"] = video_path
+        base_metrics["video_paths"] = [video_path]
+        base_metrics["sample_indices"] = [int(eval_index)]
+        base_metrics["replan_count"] = int(replan_count)
+        base_metrics["rollout_done"] = bool(done)
+        base_metrics["rollout_action_steps_executed"] = int(total_action_steps)
+        return base_metrics
+
     def _evaluate_one_sample(
         self,
         model,
@@ -618,6 +841,18 @@ class Wan22Trainer:
         model = self.accelerator.unwrap_model(self.model)
         was_dit_training = model.dit.training
         model.eval()
+
+        if self.eval_output_video_mode == "local_init_then_online_rollout":
+            if not self.accelerator.is_main_process:
+                if was_dit_training:
+                    self._set_dit_only_train_mode()
+                return None
+            rng = torch.Generator(device="cpu").manual_seed(self.global_step + self.accelerator.process_index)
+            eval_index = self._sample_eval_indices(rng, 1)[0]
+            result = self._run_local_init_then_online_rollout_eval(model, eval_index)
+            if was_dit_training:
+                self._set_dit_only_train_mode()
+            return result
 
         rng = torch.Generator(device="cpu").manual_seed(self.global_step + self.accelerator.process_index)
         sample_results = []
@@ -853,6 +1088,7 @@ class Wan22Trainer:
 
                         wandb_payload = {
                             "train/loss": global_loss,
+                            "train/loss_total": global_loss,
                             "train/grad_norm": global_grad_norm,
                             "train/lr": current_lr,
                             "performance/steps_per_sec": steps_per_sec,

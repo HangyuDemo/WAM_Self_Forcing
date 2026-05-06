@@ -154,7 +154,7 @@ def _load_model_checkpoint(model: torch.nn.Module, ckpt: str) -> None:
 
 def _is_video_lora_model_cfg(cfg: DictConfig) -> bool:
     target = str(cfg.model.get("_target_", ""))
-    return target.endswith("create_fastwam_video_lora")
+    return target.endswith("create_fastwam_video_lora") or target.endswith("create_fastwam_video_peft_lora")
 
 
 def _read_base_ckpt_hint_from_checkpoint(ckpt: str) -> Optional[str]:
@@ -183,6 +183,12 @@ def _load_eval_checkpoints(model: torch.nn.Module, cfg: DictConfig) -> None:
                 )
             base_ckpt = hinted_base_ckpt
             logging.info("Recovered base checkpoint path from LoRA checkpoint metadata: %s", base_ckpt)
+        if hasattr(model, "load_base_then_lora"):
+            model.load_base_then_lora(
+                base_checkpoint_path=str(base_ckpt),
+                lora_checkpoint_path=str(cfg.ckpt),
+            )
+            return
     if base_ckpt is not None and str(base_ckpt).strip().lower() not in {"", "none", "null"}:
         _load_model_checkpoint(model, str(base_ckpt))
         logging.info("Loaded base checkpoint for evaluation: %s", base_ckpt)
@@ -449,8 +455,8 @@ def _predict_action_chunk(
         "rand_device": str(cfg.EVALUATION.get("rand_device", "cpu")),
         "tiled": bool(cfg.EVALUATION.get("tiled", False)),
     }
-    visualize_future_video = bool(cfg.EVALUATION.get("visualize_future_video", False))
-    force_joint_infer = bool(cfg.EVALUATION.get("force_joint_infer", False))
+    visualize_future_video = bool(cfg.EVALUATION.get("visualize_future_video", True))
+    force_joint_infer = bool(cfg.EVALUATION.get("force_joint_infer", True))
     use_trainer_style_infer_api = _should_use_trainer_style_infer_api(cfg)
     predicted_future_frames = None
     if visualize_future_video:
@@ -486,7 +492,15 @@ def _predict_action_chunk(
             if visualize_future_video:
                 predicted_future_frames = _select_predicted_future_frames(pred["video"], cfg)
         else:
-            pred = model.infer_action(**infer_kwargs)
+            # Some models (e.g. FastWAMIDM) do not accept `action_cfg_scale`.
+            # Filter kwargs by signature to keep eval compatible across variants.
+            infer_action_sig = inspect.signature(model.infer_action)
+            supported_kwargs = {
+                key: value
+                for key, value in infer_kwargs.items()
+                if key in infer_action_sig.parameters
+            }
+            pred = model.infer_action(**supported_kwargs)
     action = pred["action"]  # [T, D]
 
     action = _denormalize_action(action, processor)[0]  # [T, D]
@@ -531,7 +545,7 @@ def run_single_episode(
     replan_steps = int(cfg.EVALUATION.get("replan_steps", 5))
     num_steps_wait = int(cfg.EVALUATION.get("num_steps_wait", 5))
     use_action_ensembler = bool(cfg.EVALUATION.get("use_action_ensembler", False))
-    visualize_future_video = bool(cfg.EVALUATION.get("visualize_future_video", False))
+    visualize_future_video = bool(cfg.EVALUATION.get("visualize_future_video", True))
     capture_steps = set(_get_future_frame_capture_steps(cfg)[1:])
 
     env.reset()
@@ -715,14 +729,25 @@ def run_single_task(
                     trial_idx,
                 )
             else:
-                all_gt_frames = []
                 all_rollout_frames = []
                 all_pred_frames = []
                 for clip in predicted_future_video_clips:
                     all_rollout_frames.extend(clip["rollout_frames"])
                     all_pred_frames.extend(clip["pred_frames"])
+                # Save the stacked comparison in both folders:
+                # 1) predicted_videos/ (existing)
+                # 2) videos/ (same place users usually check first)
                 save_prediction_video(
                     predicted_video_dir,
+                    all_rollout_frames,
+                    all_pred_frames,
+                    f"task{cfg.EVALUATION.task_id}_trial{trial_idx}",
+                    "all",
+                    success=success,
+                    task_description=task_description,
+                )
+                save_prediction_video(
+                    video_dir,
                     all_rollout_frames,
                     all_pred_frames,
                     f"task{cfg.EVALUATION.task_id}_trial{trial_idx}",
@@ -791,7 +816,7 @@ def eval_single_process(cfg: DictConfig):
     video_dir = local_log_dir / cfg.EVALUATION.task_suite_name / "videos"
     video_dir.mkdir(parents=True, exist_ok=True)
     predicted_video_dir = local_log_dir / cfg.EVALUATION.task_suite_name / "predicted_videos"
-    if bool(cfg.EVALUATION.get("visualize_future_video", False)):
+    if bool(cfg.EVALUATION.get("visualize_future_video", True)):
         predicted_video_dir.mkdir(parents=True, exist_ok=True)
 
     benchmark_dict = benchmark.get_benchmark_dict()
