@@ -347,6 +347,7 @@ class Wan22Trainer:
         proprio = sample.get("proprio", None)
         context = sample.get("context", None)
         context_mask = sample.get("context_mask", None)
+        multi_camera_video = sample.get("multi_camera_video", None)
 
         if not isinstance(video, torch.Tensor):
             raise TypeError(
@@ -408,6 +409,19 @@ class Wan22Trainer:
                     f"`context/context_mask` must be [B,L,D]/[B,L], got {tuple(context.shape)} and {tuple(context_mask.shape)}"
                 )
 
+        if multi_camera_video is not None:
+            if not isinstance(multi_camera_video, torch.Tensor):
+                raise TypeError(
+                    f"`sample['multi_camera_video']` must be a torch.Tensor, got {type(multi_camera_video)}"
+                )
+            if multi_camera_video.ndim == 5:
+                multi_camera_video = multi_camera_video.unsqueeze(0)
+            if multi_camera_video.ndim != 6:
+                raise ValueError(
+                    "`sample['multi_camera_video']` must be [B,V,C,T,H,W] or [V,C,T,H,W], "
+                    f"got {tuple(multi_camera_video.shape)}"
+                )
+
         return {
             "video": video,
             "prompt": prompt,
@@ -415,6 +429,7 @@ class Wan22Trainer:
             "proprio": proprio,
             "context": context,
             "context_mask": context_mask,
+            "multi_camera_video": multi_camera_video,
             "action_horizon": action_horizon,
         }
 
