@@ -69,7 +69,6 @@ class FastWAMVideoPeftLoRA(FastWAMIDM):
 
         target_modules = self._resolve_target_modules(target_substrings)
         peft_cfg = LoraConfig(
-            task_type=TaskType.FEATURE_EXTRACTION,
             r=int(rank),
             lora_alpha=float(alpha),
             lora_dropout=float(dropout),
