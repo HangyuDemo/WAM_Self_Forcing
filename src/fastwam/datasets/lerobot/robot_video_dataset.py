@@ -241,7 +241,11 @@ class RobotVideoDataset(torch.utils.data.Dataset):
         #   action: [num_frames-1, action_dim] # start from t0, except the last frame
         #   proprio: [num_frames, proprio_dim] # start from t0 to the last frame, aligned with video frames
         action = sample["action"] # [T-1, action_dim]
-        proprio = sample["proprio"][:-1, :] # [T-1, state_dim]， to align with action
+        raw_proprio = sample["proprio"]  # [T_raw, state_dim], aligned with raw video frames
+        proprio = raw_proprio[:-1, :] # [T-1, state_dim]， to align with action
+        # For IDM proprio-joint training, provide a dedicated target sequence aligned
+        # with the sampled video timeline (after action_video_freq_ratio stride).
+        future_proprio = raw_proprio[self.video_sample_indices, :]
         if video.shape[1] <= 1:
             raise ValueError(f"`video` must have at least 2 frames, got shape {tuple(video.shape)}")
         if action.shape[0] % (video.shape[1] - 1) != 0:
@@ -265,6 +269,7 @@ class RobotVideoDataset(torch.utils.data.Dataset):
             "video": video,
             "action": action,
             "proprio": proprio,
+            "future_proprio": future_proprio,
             "prompt": instruction,
             "context": context,
             "context_mask": context_mask,

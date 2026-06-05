@@ -2,11 +2,15 @@
 # Misc
 outputs/
 checkpoints
-checkpoints_idm_sf
+run_libero10_idm.slrm
+run_libero10_idm_proprio_joint.slurm
+run_libero10_idm_proprio_joint_sf.slurm
+run_libero10_idm_self_forcing.slurm
 run_libero_goal_video_lora.slurm
 run_libero_idm_jepa.slurm
 run_libero10_only_idm_self_forcing.slurm
 run_libero10_only_idm.slurm
+checkpoint_JEPA/
 data/*
 apex/
 assets/

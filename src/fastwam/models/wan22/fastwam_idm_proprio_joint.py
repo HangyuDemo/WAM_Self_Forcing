@@ -148,14 +148,21 @@ class FastWAMIDMProprioJoint(FastWAMIDM):
         temporal_factor = int(self.vae.temporal_downsample_factor)
         if temporal_factor <= 0:
             raise ValueError(f"`vae.temporal_downsample_factor` must be positive, got {temporal_factor}")
-        if (x.shape[1] - 1) % temporal_factor != 0:
+        # Canonical case: frame-aligned sequence, e.g. T=33 when factor=4.
+        if (x.shape[1] - 1) % temporal_factor == 0:
+            tail = x[:, 1:, :]
+            tail_grouped = tail.view(x.shape[0], -1, temporal_factor, x.shape[2])
+            # Match video latent grouping granularity and pick each group's aligned endpoint.
+            down = torch.cat([x[:, :1, :], tail_grouped[:, :, -1, :]], dim=1)
+        # Compatibility case: transition-aligned sequence, e.g. T=32 when factor=4.
+        # Keep the first step as anchor and then take every group's endpoint.
+        elif x.shape[1] % temporal_factor == 0:
+            body = x.view(x.shape[0], -1, temporal_factor, x.shape[2])
+            down = torch.cat([x[:, :1, :], body[:, :, -1, :]], dim=1)
+        else:
             raise ValueError(
                 f"`{name}` length cannot align with video downsample: T={x.shape[1]}, temporal_factor={temporal_factor}."
             )
-        tail = x[:, 1:, :]
-        tail_grouped = tail.view(x.shape[0], -1, temporal_factor, x.shape[2])
-        # Match video latent grouping granularity and pick each group's aligned endpoint.
-        down = torch.cat([x[:, :1, :], tail_grouped[:, :, -1, :]], dim=1)
         if down.shape[1] != latent_t:
             raise ValueError(
                 f"Downsampled `{name}` length mismatch: got {down.shape[1]}, expected {latent_t}."
@@ -466,6 +473,8 @@ class FastWAMIDMProprioJoint(FastWAMIDM):
 
     def save_checkpoint(self, path, optimizer=None, step=None):
         payload = super().save_checkpoint(path, optimizer=optimizer, step=step)
+        if payload is None:
+            payload = torch.load(path, map_location="cpu")
         if self.enable_proprio_joint:
             payload["proprio_joint_config"] = {
                 "enabled": True,

@@ -39,6 +39,7 @@ from fastwam.datasets.lerobot.processors.fastwam_processor import FastWAMProcess
 from fastwam.datasets.lerobot.utils.normalizer import load_dataset_stats_from_json
 from fastwam.utils.pytorch_utils import set_global_seed
 from fastwam.datasets.lerobot.robot_video_dataset import DEFAULT_PROMPT
+from fastwam.utils.video_io import save_mp4
 from libero.libero import benchmark
 from action_ensembler import ActionEnsembler
 
@@ -407,6 +408,44 @@ def _compute_clip_mean_psnr(
     return float(np.mean(frame_psnr_values))
 
 
+def _trajectory_to_heatmap_frame(
+    traj: np.ndarray,
+    row_idx: int,
+    height: int = 256,
+    width: int = 512,
+) -> Image.Image:
+    traj = np.asarray(traj, dtype=np.float32)
+    if traj.ndim != 2:
+        raise ValueError(f"JEPA trajectory must be 2D [T,D], got {traj.shape}")
+    t_dim, feat_dim = traj.shape
+    if t_dim <= 0 or feat_dim <= 0:
+        raise ValueError(f"Invalid JEPA trajectory shape: {traj.shape}")
+    vmax = float(np.max(np.abs(traj)))
+    vmax = max(vmax, 1e-6)
+    norm = np.clip((traj / vmax + 1.0) * 0.5, 0.0, 1.0)
+    # Expand each timestep to a visible stripe so final array is [H, W].
+    heat = np.repeat(norm, repeats=8, axis=0)
+    heat = (heat * 255.0).astype(np.uint8)
+    heat = np.stack([heat, 255 - heat, np.full_like(heat, 64)], axis=-1)
+    y0 = int(np.clip(row_idx, 0, t_dim - 1)) * 8
+    y1 = min(y0 + 8, heat.shape[0])
+    heat[y0:y1, :, :] = np.array([255, 255, 255], dtype=np.uint8)[None, None, :]
+    frame = Image.fromarray(heat, mode="RGB").resize((width, height), resample=Image.NEAREST)
+    return frame
+
+
+def _save_jepa_trajectory_video(
+    trajectory: torch.Tensor,
+    path: Path,
+    fps: int = 10,
+) -> None:
+    if trajectory.ndim != 2:
+        raise ValueError(f"`trajectory` must be [T,D], got {tuple(trajectory.shape)}")
+    traj_np = trajectory.detach().cpu().float().numpy()
+    frames = [_trajectory_to_heatmap_frame(traj_np, row_idx=t) for t in range(traj_np.shape[0])]
+    save_mp4(frames, str(path), fps=fps)
+
+
 def _predict_action_chunk(
     obs: dict,
     task_description: str,
@@ -418,7 +457,7 @@ def _predict_action_chunk(
     input_w: int,
     input_h: int,
     model_device: str,
-) -> tuple[np.ndarray, dict, Optional[list[Image.Image]]]:
+) -> tuple[np.ndarray, dict, Optional[list[Image.Image]], Optional[torch.Tensor]]:
     num_inference_steps_cfg = cfg.EVALUATION.get("num_inference_steps", None)
     if num_inference_steps_cfg is None:
         num_inference_steps = int(cfg.get("eval_num_inference_steps", 20))
@@ -459,6 +498,7 @@ def _predict_action_chunk(
     force_joint_infer = bool(cfg.EVALUATION.get("force_joint_infer", True))
     use_trainer_style_infer_api = _should_use_trainer_style_infer_api(cfg)
     predicted_future_frames = None
+    predicted_jepa_trajectory: Optional[torch.Tensor] = None
     if visualize_future_video:
         infer_kwargs["num_video_frames"] = _get_num_video_frames(cfg)
     elif "num_video_frames" in inspect.signature(model.infer_action).parameters:
@@ -491,6 +531,8 @@ def _predict_action_chunk(
                 pred = model.infer_joint(**infer_kwargs)
             if visualize_future_video:
                 predicted_future_frames = _select_predicted_future_frames(pred["video"], cfg)
+            if "jepa_trajectory" in pred and pred["jepa_trajectory"] is not None:
+                predicted_jepa_trajectory = pred["jepa_trajectory"]
         else:
             # Some models (e.g. FastWAMIDM) do not accept `action_cfg_scale`.
             # Filter kwargs by signature to keep eval compatible across variants.
@@ -511,7 +553,7 @@ def _predict_action_chunk(
     action = invert_gripper_action(action)
     if bool(cfg.EVALUATION.get("binarize_gripper", False)):
         action[..., -1] = np.sign(action[..., -1])
-    return action, imgs, predicted_future_frames
+    return action, imgs, predicted_future_frames, predicted_jepa_trajectory
 
 
 def _get_max_steps(task_suite_name: str) -> int:
@@ -559,6 +601,7 @@ def run_single_episode(
     episode_future_clip_psnr: list[float] = []
     pending_actions: list[list[float]] = []
     current_predicted_future_clip: Optional[dict[str, Any]] = None
+    jepa_rollout_clips: list[dict[str, Any]] = []
     current_replan_step = 0
     current_replan_idx = -1
 
@@ -573,7 +616,7 @@ def run_single_episode(
             continue
 
         if len(pending_actions) == 0:
-            action_chunk, imgs, predicted_future_frames = _predict_action_chunk(
+            action_chunk, imgs, predicted_future_frames, predicted_jepa_trajectory = _predict_action_chunk(
                 obs=obs,
                 task_description=task_description,
                 model=model,
@@ -591,6 +634,13 @@ def run_single_episode(
                     "rollout_frames": [imgs.copy()],
                     "pred_frames": predicted_future_frames,
                 }
+                if bool(cfg.EVALUATION.get("visualize_jepa_trajectory", True)) and predicted_jepa_trajectory is not None:
+                    jepa_rollout_clips.append(
+                        {
+                            "replan_idx": current_replan_idx,
+                            "trajectory": predicted_jepa_trajectory.detach().cpu(),
+                        }
+                    )
             else:
                 current_predicted_future_clip = None
             current_replan_step = 0
@@ -663,7 +713,7 @@ def run_single_episode(
     episode_mean_psnr = (
         float(np.mean(episode_future_clip_psnr)) if len(episode_future_clip_psnr) > 0 else None
     )
-    return bool(done), replay_images, predicted_future_video_clips, episode_mean_psnr
+    return bool(done), replay_images, predicted_future_video_clips, episode_mean_psnr, jepa_rollout_clips
 
 
 def run_single_task(
@@ -693,7 +743,7 @@ def run_single_task(
         results["future_video_psnr_mean"] = None
 
     for trial_idx in range(int(cfg.EVALUATION.num_trials)):
-        success, replay_images, predicted_future_video_clips, episode_mean_psnr = run_single_episode(
+        success, replay_images, predicted_future_video_clips, episode_mean_psnr, jepa_rollout_clips = run_single_episode(
             env=env,
             initial_state=initial_states[trial_idx],
             task_description=task_description,
@@ -755,6 +805,27 @@ def run_single_task(
                     success=success,
                     task_description=task_description,
                 )
+        if bool(cfg.EVALUATION.get("visualize_jepa_trajectory", True)) and len(jepa_rollout_clips) > 0:
+            jepa_dir = predicted_video_dir / "jepa_trajectory"
+            jepa_dir.mkdir(parents=True, exist_ok=True)
+            stitched_frames = []
+            for clip in jepa_rollout_clips:
+                traj = clip["trajectory"]
+                clip_name = (
+                    f"task{cfg.EVALUATION.task_id}_trial{trial_idx}_replan{clip['replan_idx']}"
+                    f"{'_success' if success else '_fail'}.mp4"
+                )
+                clip_path = jepa_dir / clip_name
+                _save_jepa_trajectory_video(traj, clip_path, fps=int(cfg.EVALUATION.get("jepa_vis_fps", 10)))
+                traj_np = traj.detach().cpu().float().numpy()
+                for t_idx in range(traj_np.shape[0]):
+                    stitched_frames.append(_trajectory_to_heatmap_frame(traj_np, row_idx=t_idx))
+            if len(stitched_frames) > 0:
+                stitched_path = jepa_dir / (
+                    f"task{cfg.EVALUATION.task_id}_trial{trial_idx}_all"
+                    f"{'_success' if success else '_fail'}.mp4"
+                )
+                save_mp4(stitched_frames, str(stitched_path), fps=int(cfg.EVALUATION.get("jepa_vis_fps", 10)))
 
     if visualize_future_video:
         valid_episode_psnr = [x for x in results["episode_future_video_psnr"] if x is not None]

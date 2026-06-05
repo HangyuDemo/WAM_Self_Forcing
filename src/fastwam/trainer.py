@@ -345,6 +345,7 @@ class Wan22Trainer:
         prompt = sample["prompt"]
         action = sample.get("action", None)
         proprio = sample.get("proprio", None)
+        future_proprio = sample.get("future_proprio", None)
         context = sample.get("context", None)
         context_mask = sample.get("context_mask", None)
         multi_camera_video = sample.get("multi_camera_video", None)
@@ -397,6 +398,20 @@ class Wan22Trainer:
             if proprio.ndim != 3:
                 raise ValueError(f"`sample['proprio']` must be 3D [B, T, d], got shape {tuple(proprio.shape)}")
 
+        future_proprio = None
+        if "future_proprio" in sample:
+            future_proprio = sample["future_proprio"]
+            if not isinstance(future_proprio, torch.Tensor):
+                raise TypeError(
+                    f"`sample['future_proprio']` must be a torch.Tensor, got {type(future_proprio)}"
+                )
+            if future_proprio.ndim == 2:
+                future_proprio = future_proprio.unsqueeze(0)
+            if future_proprio.ndim != 3:
+                raise ValueError(
+                    f"`sample['future_proprio']` must be 3D [B, T, d], got shape {tuple(future_proprio.shape)}"
+                )
+
         if context is not None or context_mask is not None:
             if context is None or context_mask is None:
                 raise ValueError("`context` and `context_mask` must both exist in eval sample.")
@@ -427,6 +442,7 @@ class Wan22Trainer:
             "prompt": prompt,
             "action": action,
             "proprio": proprio,
+            "future_proprio": future_proprio,
             "context": context,
             "context_mask": context_mask,
             "multi_camera_video": multi_camera_video,
